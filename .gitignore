@@ -1,0 +1,12 @@
+.DS_Store
+__pycache__/
+*.pyc
+*.log
+
+# 运行期数据绝不入库（作业区在 ~/.agents/jobs，这里只防有人在技能目录里试跑）
+runs/
+jobs/runs/
+ledger.jsonl
+registry.json
+.tmp-jobs/
+*.result.json

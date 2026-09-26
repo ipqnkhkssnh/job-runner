@@ -1,0 +1,87 @@
+// 示例 B · GUI 交接协议（暂停 / 续跑 / 人闸门）
+// 演示：map + skill（等 agent 用 a2desk 执行）→ tool → assert → approve（等人）→ notify（对外投递，等人）
+// 能力卡用的是本地假卡（cards/demo-collect.json），跑通协议不依赖任何真实系统。
+{
+  "job": "b-gui-handoff",
+  "version": "0.1.0",
+  "goal": "演示 skill 步骤的暂停/续跑协议：agent 在真实系统里干完活写回结果，引擎继续往下跑",
+
+  "inputs": [
+    { "name": "scope", "type": "list", "required": true,
+      "desc": "要在 GUI 系统里逐个采集的 key（示例用 alpha,beta）" }
+  ],
+
+  "requires": {
+    "env": { "class": "test", "secrets": ["ref:demo-account"] }
+  },
+
+  "channels": { "fallback": ["remote-a2desk", "local-a2desk", "playwright"] },
+
+  "steps": [
+    // 1) 逐个 key 去 GUI 采集：每个元素都要 agent 实际动手
+    {
+      "id": "collect-all",
+      "kind": "map",
+      "for_each": "${inputs.scope}",
+      "steps": [
+        {
+          "id": "collect",
+          "kind": "skill",
+          "use": "local:cards/demo-collect.json",
+          "inputs": { "key": "${item}" },
+          "effects": "read",
+          "out": "artifacts/collected/${item}.csv",
+          "verify": [ { "name": "not_empty", "paths": "artifacts/collected/${item}.csv" } ]
+        }
+      ]
+    },
+
+    // 2) 采集回来的东西统一规范化
+    {
+      "id": "normalize",
+      "kind": "tool",
+      "run": ["python3", "tools/normalize.py",
+              "--inbox", "${artifacts}/collected",
+              "--out", "${artifacts}/normalized.csv"],
+      "out": "artifacts/normalized.csv"
+    },
+
+    // 3) 判据：证明采集结果齐、键唯一
+    {
+      "id": "checks",
+      "kind": "assert",
+      "invariants": [
+        { "name": "not_empty", "path": "artifacts/normalized.csv" },
+        { "name": "columns_present", "path": "artifacts/normalized.csv",
+          "columns": ["id", "amount"] },
+        { "name": "keys_unique", "path": "artifacts/normalized.csv", "key": "id" },
+        { "name": "row_count_between", "path": "artifacts/normalized.csv", "min": 1 }
+      ]
+    },
+
+    // 4) 人闸门：交付之前必须有人点头
+    {
+      "id": "signoff",
+      "kind": "approve",
+      "message": "采集并核对完成，准备把结果交付出去。确认继续？",
+      "effects": "read",
+      "remember": ["交付对象", "本次范围"]
+    },
+
+    // 5) 对外投递：gate=approve，必须再放行一次（两步确认是刻意设计）
+    {
+      "id": "deliver",
+      "kind": "notify",
+      "target": { "kind": "file", "path": "artifacts/outbox/delivery.json" },
+      "payload": {
+        "job": "${job.name}",
+        "run": "${run.id}",
+        "artifact": "${steps.normalize.out}"
+      },
+      "effects": "outbound",
+      "gate": "approve"
+    }
+  ],
+
+  "onFailure": { "classify": ["env", "knowledge", "data"] }
+}

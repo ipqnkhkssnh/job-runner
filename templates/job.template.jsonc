@@ -1,0 +1,98 @@
+// job.jsonc — job 定义模板（JSONC：JSON + // 注释 + 尾逗号容错；零第三方依赖）
+// 规范全文见 references/job-format.md。删掉用不到的步骤，别留空壳。
+{
+  "job": "{{JOB_NAME}}",
+  "version": "0.1.0",
+  "goal": "一句话说清这个作业要达成什么（人看得懂，不要写实现）",
+
+  // 入参：集合/标量/文件都从这儿进。运行时用 --input k=v 传，必填项缺了会直接拒绝跑。
+  "inputs": [
+    { "name": "scope", "type": "list", "required": true,
+      "desc": "这次要处理的范围（如若干客户/若干单号/若干分片）" }
+  ],
+
+  // 依赖：技能版本不满足时 validate 直接报错（避免用旧知识跑新流程）
+  "requires": {
+    "skills": [ { "name": "some-platform-skill", "version": ">=0.1" } ],
+    "env": { "class": "any", "secrets": [] }   // secrets 只写引用：["ref:xxx"]
+  },
+
+  // 可用通道（skill 步骤没写 channel 时的兜底顺序）
+  "channels": { "fallback": ["remote-a2desk", "local-a2desk", "playwright"] },
+
+  "steps": [
+    // ---- 1) 批量取数（map + tool）：把 scope 里每个元素变成一份产物 ----
+    {
+      "id": "fetch-all",
+      "kind": "map",
+      "for_each": "${inputs.scope}",
+      "steps": [
+        {
+          "id": "fetch",
+          "kind": "tool",
+          "run": ["python3", "tools/fetch_one.py",
+                  "--key", "${item}", "--out", "${artifacts}/${item}.json"],
+          "effects": "read",
+          "out": "artifacts/${item}.json",
+          "timeout": 300
+        }
+      ]
+    },
+
+    // ---- 2) GUI 操作（skill）：必须由 agent 用 a2desk/playwright 执行 ----
+    // 引擎跑到这里会暂停（退出码 3），落一份 pending 指令；
+    // agent 做完写 result.json，再 jobctl resume 继续。
+    {
+      "id": "collect-from-gui",
+      "kind": "skill",
+      "use": "some-platform-skill/some-task",     // ← 指向 learn-skill 产的能力卡
+      "inputs": { "key": "${inputs.scope}" },
+      "effects": "read",
+      "out": "artifacts/gui/*.csv",
+      "verify": [ { "name": "not_empty", "paths": "artifacts/gui/*.csv" } ]
+    },
+
+    // ---- 3) 确定性加工（tool）：所有业务计算都在脚本里，别让模型心算 ----
+    {
+      "id": "normalize",
+      "kind": "tool",
+      "run": ["python3", "tools/normalize.py",
+              "--inbox", "${artifacts}", "--out", "${artifacts}/normalized.csv"],
+      "out": "artifacts/normalized.csv"
+    },
+
+    // ---- 4) 数据层判据（assert）：证明「对」，而不是「点了」 ----
+    {
+      "id": "checks",
+      "kind": "assert",
+      "invariants": [
+        { "name": "not_empty", "path": "artifacts/normalized.csv" },
+        { "name": "columns_present", "path": "artifacts/normalized.csv",
+          "columns": ["id", "amount"] },
+        { "name": "keys_unique", "path": "artifacts/normalized.csv", "key": "id" },
+        { "name": "row_count_between", "path": "artifacts/normalized.csv", "min": 1 }
+      ]
+    },
+
+    // ---- 5) 人闸门（approve）：任何写库/对外/不可逆动作之前 ----
+    {
+      "id": "signoff",
+      "kind": "approve",
+      "message": "即将提交 ${steps.normalize.out}（共若干条）。确认继续？",
+      "effects": "read"
+    },
+
+    // ---- 6) 对外投递（notify）：默认必须有人放行 ----
+    {
+      "id": "deliver",
+      "kind": "notify",
+      "target": { "kind": "file", "path": "artifacts/outbox/delivery.json" },
+      "payload": { "job": "${job.name}", "run": "${run.id}" },
+      "effects": "outbound",
+      "gate": "approve"
+    }
+  ],
+
+  // 失败分类（env / knowledge / data）——只有 knowledge 会回写 learn-skill
+  "onFailure": { "classify": ["env", "knowledge", "data"] }
+}

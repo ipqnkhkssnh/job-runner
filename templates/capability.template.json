@@ -1,0 +1,61 @@
+{
+  "card": "v1",
+
+  "skill": "some-platform",
+  "task": "some-task",
+  "title": "人能看懂的任务名（例：按条件取订单列表）",
+  "version": "0.1.0",
+
+  "system": "这个任务属于哪个系统",
+  "channel": "auto",
+  "envClass": "unknown",
+  "effects": "read",
+
+  "inputs": [
+    { "name": "scope", "type": "list", "required": true,
+      "desc": "入参含义 + 从哪来（用户给 / 上游步骤产物）" }
+  ],
+
+  "outputs": [
+    { "name": "records", "path": "artifacts/records/*.csv", "type": "csv",
+      "desc": "产物落在 run 目录内的相对路径（引擎靠它回读证据）" }
+  ],
+
+  "secretsRef": ["ref:账号来源"],
+
+  "selectors": {
+    "page": "页面标题或 URL 特征（判断前置条件是否满足）",
+    "entries": [
+      { "step": 1, "by": "menu", "text": "左侧菜单项文字" },
+      { "step": 2, "by": "label", "text": "字段标签", "action": "type" },
+      { "step": 3, "by": "button", "text": "按钮文字", "action": "click" }
+    ],
+    "waits": [ { "after": 3, "for": "结果表出现/提示条文字" } ]
+  },
+
+  "automationBoundary": {
+    "needsHuman": ["登录验证码", "短信确认"],
+    "notes": "哪些步骤不允许自动做，必须人来做或人来放行"
+  },
+
+  "steps": [
+    { "n": 1, "do": "语义定位 + 动作", "expect": "可观察的反馈（不要写『成功』）" }
+  ],
+
+  "verify": [
+    { "name": "columns_present", "path": "artifacts/records/x.csv", "columns": ["id"] }
+  ],
+
+  "effectsDetail": {
+    "changes": "会不会改业务状态",
+    "outbound": "会不会对外发送",
+    "idempotent": "重复执行会怎样"
+  },
+
+  "evidence": { "frames": "f018-f024", "assets": ["assets/xxx.jpg"] },
+
+  "unknowns": ["界面上看到但没操作过的分支"],
+
+  "updatedAt": "YYYY-MM-DD",
+  "learnedBy": "learn-skill"
+}

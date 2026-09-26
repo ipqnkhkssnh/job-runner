@@ -1,0 +1,71 @@
+{
+  "card": "v1",
+
+  "_note": "这是示例用的**假能力卡**（skill=demo-crm 并不存在）。真实卡片由 learn-skill 在 <技能包>/tasks/<task>.json 产出。",
+
+  "skill": "demo-crm",
+  "task": "collect-records",
+  "title": "按 key 采集记录列表",
+  "version": "0.1.0",
+
+  "system": "Demo CRM（示例）",
+  "channel": "local-a2desk",
+  "envClass": "test",
+  "effects": "read",
+
+  "inputs": [
+    { "name": "key", "type": "string", "required": true,
+      "desc": "要采集的 key，由上游 map 的 ${item} 提供" }
+  ],
+
+  "outputs": [
+    { "name": "records", "path": "artifacts/collected/${item}.csv", "type": "csv",
+      "desc": "导出的记录列表" }
+  ],
+
+  "secretsRef": ["ref:demo-account"],
+
+  "selectors": {
+    "page": "窗口标题包含「Demo CRM」，地址栏 /records",
+    "entries": [
+      { "step": 1, "by": "menu", "text": "记录管理" },
+      { "step": 2, "by": "label", "text": "关键字", "action": "type", "value": "${inputs.key}" },
+      { "step": 3, "by": "button", "text": "查询", "action": "click" },
+      { "step": 4, "by": "button", "text": "导出", "action": "click" }
+    ],
+    "waits": [
+      { "after": 3, "for": "结果表出现且行数 ≥ 1" },
+      { "after": 4, "for": "出现下载完成提示或导出记录行" }
+    ]
+  },
+
+  "automationBoundary": {
+    "needsHuman": ["登录验证码"],
+    "notes": "查询与导出可以自动做；登录态由用户先建立好（前置条件）"
+  },
+
+  "steps": [
+    { "n": 1, "do": "左侧菜单点「记录管理」", "expect": "出现记录列表页，标题为「记录管理」" },
+    { "n": 2, "do": "「关键字」输入框填 key，点「查询」", "expect": "列表只剩匹配行，行数 ≥ 1" },
+    { "n": 3, "do": "点「导出」，把导出文件转成 csv 落到约定路径",
+      "expect": "文件存在且表头含 id, amount" }
+  ],
+
+  "verify": [
+    { "name": "columns_present", "path": "artifacts/collected/${item}.csv",
+      "columns": ["id", "amount"] }
+  ],
+
+  "effectsDetail": {
+    "changes": "无（只读查询与导出）",
+    "outbound": "无",
+    "idempotent": "是：重复查询不产生数据变化"
+  },
+
+  "evidence": { "frames": "f010-f026", "assets": [] },
+
+  "unknowns": ["「批量导出」按钮的行为（界面可见，未实操）"],
+
+  "updatedAt": "2026-09-26",
+  "learnedBy": "learn-skill"
+}

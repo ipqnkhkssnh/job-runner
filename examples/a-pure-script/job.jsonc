@@ -1,0 +1,96 @@
+// 示例 A · 纯脚本作业（不需要任何 GUI / 外部系统，用来验证引擎本身）
+// 演示：map 批量 → tool 加工 → assert 数据层判据 → tool 产出交付物
+{
+  "job": "a-pure-script",
+  "version": "0.1.0",
+  "goal": "把若干分片数据汇总、规范化，与一份参考表核对，产出一份对账结果与摘要",
+
+  "inputs": [
+    { "name": "shards", "type": "list", "required": true,
+      "desc": "要汇总的分片名（示例用 alpha,beta,gamma）" }
+  ],
+
+  "requires": { "env": { "class": "any", "secrets": [] } },
+
+  "steps": [
+    // 1) 批量取数：每个分片一份产物（真实作业里这里可能是 kind:"skill" 去 GUI 导出）
+    {
+      "id": "fetch-all",
+      "kind": "map",
+      "for_each": "${inputs.shards}",
+      "steps": [
+        {
+          "id": "fetch",
+          "kind": "tool",
+          "run": ["python3", "tools/fetch_shard.py",
+                  "--shard", "${item}",
+                  "--rows", "4",
+                  "--out", "${artifacts}/inbox/${item}.csv"],
+          "effects": "read",
+          "out": "artifacts/inbox/${item}.csv"
+        }
+      ]
+    },
+
+    // 2) 确定性加工：合并 + 去重 + 统一列（业务计算全在脚本里）
+    {
+      "id": "normalize",
+      "kind": "tool",
+      "run": ["python3", "tools/normalize.py",
+              "--inbox", "${artifacts}/inbox",
+              "--out", "${artifacts}/normalized.csv"],
+      "out": "artifacts/normalized.csv"
+    },
+
+    // 3) 与参考表核对：一行不丢，逐行打状态
+    {
+      "id": "reconcile",
+      "kind": "tool",
+      "run": ["python3", "tools/reconcile.py",
+              "--records", "${artifacts}/normalized.csv",
+              "--reference", "${job.dir}/tools/reference.csv",
+              "--out-joined", "${artifacts}/joined.csv",
+              "--out-exceptions", "${artifacts}/exceptions.csv",
+              "--out-orphans", "${artifacts}/reference-orphans.csv"],
+      "out": ["artifacts/joined.csv", "artifacts/exceptions.csv",
+              "artifacts/reference-orphans.csv"]
+    },
+
+    // 4) 数据层判据：证明「对」，而不是「跑完了」
+    {
+      "id": "checks",
+      "kind": "assert",
+      "invariants": [
+        { "name": "not_empty", "path": "artifacts/normalized.csv" },
+        { "name": "columns_present", "path": "artifacts/joined.csv",
+          "columns": ["id", "amount", "status"] },
+        { "name": "keys_unique", "path": "artifacts/joined.csv", "key": "id" },
+        { "name": "subset_keys",
+          "left": { "path": "artifacts/normalized.csv", "key": "id" },
+          "right": { "path": "artifacts/joined.csv", "key": "id" },
+          "note": "规范化后的每一行都必须出现在对账结果里（一行都不能丢）" },
+        { "name": "subset_keys",
+          "left": { "path": "artifacts/exceptions.csv", "key": "id" },
+          "right": { "path": "artifacts/joined.csv", "key": "id" } },
+        { "name": "subset_keys",
+          "left": { "path": "artifacts/reference-orphans.csv", "key": "id" },
+          "right": { "path": "artifacts/joined.csv", "key": "id" } },
+        { "name": "row_count_between", "path": "artifacts/joined.csv", "min": 1 }
+      ]
+    },
+
+    // 5) 交付物：摘要 + 人看的对账表
+    {
+      "id": "digest",
+      "kind": "tool",
+      "run": ["python3", "tools/digest.py",
+              "--joined", "${artifacts}/joined.csv",
+              "--exceptions", "${artifacts}/exceptions.csv",
+              "--out-json", "${artifacts}/digest.json",
+              "--out-csv", "${artifacts}/result.csv"],
+      "out": ["artifacts/digest.json", "artifacts/result.csv"]
+    }
+  ],
+
+  "onFailure": { "classify": ["env", "knowledge", "data"] }
+}

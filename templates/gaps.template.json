@@ -1,0 +1,34 @@
+{
+  "_doc": "gaps.json 的固定形状（由 jobctl 自动写出，这里是给人的规范说明）。kind=knowledge 的条目才需要回写 learn-skill；env/data 属于现场修，不进技能。",
+
+  "runId": "example-job-20260926-101500-1a2b",
+  "job": "example-job",
+  "generatedAt": "2026-09-26T10:15:03+08:00",
+  "status": "done",
+  "class": null,
+  "counts": { "knowledge": 1, "env": 0, "data": 0 },
+
+  "gaps": [
+    {
+      "kind": "knowledge",
+      "step": "map#0/collect",
+      "skill": "some-platform",
+      "task": "some-task",
+      "item": "alpha",
+      "reason": "界面上多了「批量导出」按钮，能力卡里没有；本次未点，标为未知",
+      "evidence": "evidence/map_0_collect/shot-03.png",
+      "action": "用 learn-skill 模式 B 补学该分支并回写能力卡",
+      "at": "2026-09-26T10:15:01+08:00"
+    },
+    {
+      "kind": "env",
+      "step": "normalize",
+      "reason": "openpyxl 未安装",
+      "action": "python3 -m pip install openpyxl，或让上游产出 csv",
+      "at": "2026-09-26T10:15:02+08:00"
+    }
+  ],
+
+  "handoff": "learn-skill",
+  "handoffNote": "按 learn-skill 模式 B：读现状 → 确认安全边界 → 边操作边补学 → 回写能力卡/页面知识 → 升版本"
+}
