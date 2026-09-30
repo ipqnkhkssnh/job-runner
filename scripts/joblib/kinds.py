@@ -362,39 +362,57 @@ def _start_readback(step, ctx, card, rb, done):
                    "写成功，回读一致：" + str(res.get("detail", ""))[:200],
                    effects, extra={"readback": "verified"})
 
-    # how == skill：再暂停一次，让执行方重新读一遍
+    # how == skill / mcp：再暂停一次，让执行方重新读一遍。
+    # mcp 与 skill 的区别只是「拿什么读」：mcp 走只读 MCP 工具（数据层，最优先通道），
+    # skill 走一张只读能力卡（界面）。MCP 是 agent 侧能力，引擎自己调不了，所以同样暂停等接手。
+    is_mcp = rb.get("how") == "mcp"
     pending, result_file = _paths(ctx, "readback")
     pending.parent.mkdir(parents=True, exist_ok=True)
     ev = Path(ctx["run_dir"]) / "evidence" / (ctx["step_path"].replace("/", "_") + ".readback")
     ev.mkdir(parents=True, exist_ok=True)
     rcard, rpath, rskill, rtask = None, None, "", ""
     use = str(rb.get("use") or "")
-    try:
-        rcard, rpath, rskill, rtask = resolve_card(use, Path(ctx["job_dir"]), ctx["skills_root"])
-    except CardError:
-        pass
-    if not rskill:
-        rskill, _, rtask = use.partition("/")
-    directive = {
-        "runId": ctx["run_id"], "job": ctx["job_name"], "step": ctx["step_path"],
-        "kind": "skill", "phase": "readback", "status": "needs_agent",
-        "instruction": (
+    if not is_mcp:
+        try:
+            rcard, rpath, rskill, rtask = resolve_card(use, Path(ctx["job_dir"]), ctx["skills_root"])
+        except CardError:
+            pass
+        if not rskill:
+            rskill, _, rtask = use.partition("/")
+    if is_mcp:
+        instruction = (
+            "写操作已经执行。现在做**写后回读**：调**只读 MCP 工具**（不是去点界面）把刚改的对象再查一次，"
+            "把真实结果落成产物，再逐项比对期望值。"
+            "回读不一致就照实报告——不要为了让流程走下去而说成功。")
+        rb_block = {
+            "how": "mcp", "tool": rb.get("tool"), "args": resolve(rb.get("args") or {}, ctx["refs"]),
+            "expect": resolve(expects, ctx["refs"]),
+            "out": resolve(out_spec, ctx["refs"]) if out_spec else [],
+            "why": "有确定性只读接口时，数据层核对优先于点界面（通道优先级 mcp > api > GUI）",
+        }
+    else:
+        instruction = (
             "写操作已经执行。现在做**写后回读**：用只读方式把刚改的对象重新查一次，"
             "把真实值落成产物，再逐项比对期望值。"
-            "回读不一致就照实报告——不要为了让流程走下去而说成功。"),
-        "readback": {
+            "回读不一致就照实报告——不要为了让流程走下去而说成功。")
+        rb_block = {
             "how": "skill", "use": use,
             "expect": resolve(expects, ctx["refs"]),
             "out": resolve(out_spec, ctx["refs"]) if out_spec else [],
             "why": "无 API 的系统拿不到数据层，只能用「重新读一次 + 比对字段值」当判据",
-        },
-        "capability": {
+        }
+    directive = {
+        "runId": ctx["run_id"], "job": ctx["job_name"], "step": ctx["step_path"],
+        "kind": "skill", "phase": "readback", "status": "needs_agent",
+        "instruction": instruction,
+        "readback": rb_block,
+        "capability": None if is_mcp else {
             "skill": rskill, "task": rtask, "cardPath": str(rpath) if rpath else None,
             "title": (rcard or {}).get("title"), "card": rcard,
             "steps": (rcard or {}).get("steps"),
         },
-        "selectors": (rcard or {}).get("selectors") or (rcard or {}).get("locators"),
-        "channel": _channel_block(step, rcard or card, ctx["job"]),
+        "selectors": None if is_mcp else ((rcard or {}).get("selectors") or (rcard or {}).get("locators")),
+        "channel": _channel_block(step, card if is_mcp else (rcard or card), ctx["job"]),
         "evidence": _evidence_block(card, ctx.get("card_path")),
         "inputs": resolve(step.get("inputs") or step.get("in") or {}, ctx["refs"]),
         "item": ctx.get("item"),

@@ -426,6 +426,75 @@ out="$(LEARN_SKILLS_ROOT="$SKROOT" $CTL --root "$TMP/jobs" resume "$RIDR2" 2>&1)
 grep -q 'field_equals' "$RUND2/report.md" 2>/dev/null && ok "回读判据进了报告（可审计）" \
   || bad "报告里没有回读判据"
 
+# ---------------------------------------------------------------- 5.1 回读走 MCP（有确定性接口就别点界面）
+head_ "5.1 写后回读走只读 MCP 工具（数据层判据，优先于点界面）"
+mkdir -p "$TMP/mcp-readback"
+cat > "$SKROOT/demo-write/tasks/write-thing-mcp.json" <<'JSON'
+{
+  "card": "v2", "skill": "demo-write", "task": "write-thing-mcp",
+  "title": "写一个东西（回读走 MCP，自测）", "version": "0.1.0",
+  "system": "demo", "channel": "local-a2desk", "envClass": "test",
+  "effects": "write", "evidenceLevel": "verified-once", "evidenceBasis": "自测",
+  "impact": { "blastRadius": "单条记录", "count": 1, "reversible": true },
+  "inputs": [ { "name": "key", "type": "string", "required": true } ],
+  "outputs": [ { "name": "receipt", "path": "artifacts/written.txt", "type": "txt" } ],
+  "readback": { "how": "mcp", "tool": "bbcs_search_assets",
+                "args": { "keyword": "${inputs.key}", "kind": "material" },
+                "out": "artifacts/readback.csv",
+                "expect": [ { "name": "field_equals", "path": "artifacts/readback.csv",
+                              "key": "key", "value": "${inputs.key}",
+                              "field": "status", "equals": "已生效" } ] },
+  "selectors": { "page": "demo 页面", "entries": [] }
+}
+JSON
+out="$(LEARN_SKILLS_ROOT="$SKROOT" $CTL --root "$TMP/jobs" card demo-write/write-thing-mcp 2>&1)"; rc=$?
+[ $rc -eq 0 ] && ok "readback.how=mcp 的卡通过校验" || { bad "mcp 卡校验失败"; printf '%s\n' "$out" | tail -4; }
+cat > "$TMP/mcp-readback/job.jsonc" <<'JSON'
+{
+  "job": "mcp-readback", "goal": "回读走 MCP",
+  "inputs": [ { "name": "key", "type": "string", "required": true } ],
+  "requires": { "env": { "class": "test" }, "skills": [ { "name": "demo-write" } ] },
+  "steps": [ { "id": "w", "kind": "skill", "use": "demo-write/write-thing-mcp",
+               "effects": "write", "gate": "approve", "idempotency": "mcprb:${inputs.key}",
+               "inputs": { "key": "${inputs.key}" }, "out": "artifacts/written.txt" } ]
+}
+JSON
+out="$(LEARN_SKILLS_ROOT="$SKROOT" $CTL --root "$TMP/jobs" run "$TMP/mcp-readback" --input key=M1 2>&1)"; rc=$?
+RIDM="$(run_id_of "$out")"
+LEARN_SKILLS_ROOT="$SKROOT" $CTL --root "$TMP/jobs" resume "$RIDM" --approve --by selftest >/dev/null 2>&1
+RUNDM="$TMP/jobs/runs/$RIDM"
+printf '{"ok":true,"out":["artifacts/written.txt"],"observations":"写完了"}' > "$RUNDM/pending/w.result.json"
+mkdir -p "$RUNDM/artifacts"; printf 'done' > "$RUNDM/artifacts/written.txt"
+out="$(LEARN_SKILLS_ROOT="$SKROOT" $CTL --root "$TMP/jobs" resume "$RIDM" 2>&1)"; rc=$?
+[ $rc -eq 3 ] && [ -f "$RUNDM/pending/w.readback.json" ] && ok "写完自动进入回读阶段" || bad "没进入回读 rc=$rc"
+python3 - "$RUNDM/pending/w.readback.json" <<'PY' && ok "回读指令把通道标成 mcp、带上工具名与入参、且不带能力卡" || bad "回读指令结构不对"
+import json, sys
+d = json.load(open(sys.argv[1], encoding="utf-8"))
+rb = d.get("readback") or {}
+assert rb.get("how") == "mcp", rb
+assert rb.get("tool") == "bbcs_search_assets", rb
+assert rb.get("args") == {"keyword": "M1", "kind": "material"}, rb
+assert d.get("capability") is None, d.get("capability")
+assert "MCP" in (d.get("instruction") or ""), d.get("instruction")
+PY
+printf '{"ok":true,"out":["artifacts/readback.csv"],"observations":"查到该素材"}' > "$RUNDM/pending/w.readback.result.json"
+printf 'key,status\nM1,已生效\n' > "$RUNDM/artifacts/readback.csv"
+out="$(LEARN_SKILLS_ROOT="$SKROOT" $CTL --root "$TMP/jobs" resume "$RIDM" 2>&1)"; rc=$?
+[ $rc -eq 0 ] && ok "MCP 回读一致 → 作业完成" || { bad "期望完成 rc=0，实际 $rc"; printf '%s\n' "$out" | tail -4; }
+grep -q '回读一致' "$RUNDM/report.md" 2>/dev/null && ok "报告里写明回读一致" || bad "报告没写回读结论"
+# 负向：MCP 回读说不一致 → 必须判失败（不能"点了下发就算成功"）
+out="$(LEARN_SKILLS_ROOT="$SKROOT" $CTL --root "$TMP/jobs" run "$TMP/mcp-readback" --input key=M2 2>&1)"
+RIDM2="$(run_id_of "$out")"; RUNDM2="$TMP/jobs/runs/$RIDM2"
+LEARN_SKILLS_ROOT="$SKROOT" $CTL --root "$TMP/jobs" resume "$RIDM2" --approve >/dev/null 2>&1
+printf '{"ok":true,"out":["artifacts/written.txt"],"observations":"写完了"}' > "$RUNDM2/pending/w.result.json"
+mkdir -p "$RUNDM2/artifacts"; printf 'done' > "$RUNDM2/artifacts/written.txt"
+LEARN_SKILLS_ROOT="$SKROOT" $CTL --root "$TMP/jobs" resume "$RIDM2" >/dev/null 2>&1
+printf '{"ok":true,"out":["artifacts/readback.csv"],"observations":"MCP 查不到该素材"}' > "$RUNDM2/pending/w.readback.result.json"
+printf 'key,status\nM2,未生效\n' > "$RUNDM2/artifacts/readback.csv"
+out="$(LEARN_SKILLS_ROOT="$SKROOT" $CTL --root "$TMP/jobs" resume "$RIDM2" 2>&1)"; rc=$?
+[ $rc -eq 1 ] && printf '%s' "$out" | grep -q '回读不一致' \
+  && ok "★ MCP 回读不一致被判失败" || { bad "期望 rc=1，实际 $rc"; printf '%s\n' "$out" | tail -4; }
+
 # ---------------------------------------------------------------- 6. 批量闸门聚合
 head_ "6. 闸门聚合（一批一次确认，而不是逼人点 N 次）"
 mkdir -p "$TMP/batch"

@@ -20,7 +20,7 @@ from .invariants import unknown_invariants
 CARD_REQUIRED = ("card", "skill", "task", "version", "outputs")
 CARD_VERSIONS = ("v1", "v2", "inline")
 
-READBACK_HOW = ("skill", "tool")
+READBACK_HOW = ("skill", "tool", "mcp")
 
 _USE_SKILL_RE = re.compile(r"^([a-z0-9][a-z0-9-]*)/([A-Za-z0-9][A-Za-z0-9._-]*)$")
 
@@ -197,6 +197,8 @@ def validate_card(card: dict, path=None) -> list:
                 errs.append("能力卡 readback.how=skill 时缺 `use`（用哪个只读任务回读）")
             if how == "tool" and not rb.get("run"):
                 errs.append("能力卡 readback.how=tool 时缺 `run`（回读脚本）")
+            if how == "mcp" and not rb.get("tool"):
+                errs.append("能力卡 readback.how=mcp 时缺 `tool`（调哪个只读 MCP 工具）")
             if rb.get("out"):
                 p = str(rb["out"])
                 if p.startswith("/") or ".." in Path(p).parts:
