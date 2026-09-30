@@ -161,12 +161,22 @@ class Runner:
         if resume:
             self.load_state()
             st = self.state
-            if st.get("status") == "done":
+            prev = st.get("status")
+            if prev == "done":
                 return {"status": "done", "message": "这次 run 已经完成了，不重复执行"}
             st["status"] = "running"
             pause = st.get("pause")
-            if pause is None:
-                raise JobError("这次 run 没有待处理的暂停点；直接用 run --run-id 重跑即可")
+            # 失败的 run 也要能续：agent 把 pending/<step>.result.json 修好（或环境恢复）后 resume，
+            # 主循环会跳过 done 的步骤、重进那个 failed 的步骤并重新消费结果文件。
+            # 否则「数据走文件」这条铁律在这条路径上是断的——失败即终态、改好也回不去。
+            if pause is None and prev != "failed":
+                raise JobError(
+                    f"这次 run 没有待处理的暂停点（状态 {prev}）；"
+                    "用 run --run-id <新 id> 重跑，或修好 pending/ 下的结果文件后 resume")
+            if prev == "failed":
+                self.ledger({"job": self.job_name, "runId": self.run_id, "event": "run-retry",
+                             "failedSteps": [k for k, v in (st.get("steps") or {}).items()
+                                             if isinstance(v, dict) and v.get("status") == "failed"]})
         else:
             if self.run_dir.exists():
                 raise JobError(f"run 目录已存在：{self.run_dir}（换 --run-id，或用 resume）")

@@ -457,6 +457,56 @@ assert ex.get("approvedItems") == ["A", "C"], ex
 assert ex.get("rejectedItems") == ["B"], ex
 PY
 
+# ---------------------------------------------------------------- 6.1 失败的 agent 结果：修好后必须能续跑
+head_ "6.1 agent 结果文件写坏 → 判 data 失败 → 修好后 resume 必须能续"
+mkdir -p "$TMP/fix-retry"
+cat > "$TMP/fix-retry/job.jsonc" <<'JSON'
+{
+  "job": "fix-retry", "goal": "测：结果文件写坏判失败后，修好能否续跑",
+  "inputs": [ { "name": "key", "type": "string", "required": true } ],
+  "requires": { "env": { "class": "test" }, "skills": [ { "name": "demo-write" } ] },
+  "steps": [ { "id": "w", "kind": "skill", "use": "demo-write/write-thing",
+               "effects": "write", "gate": "approve",
+               "idempotency": "fix-retry:K1",
+               "inputs": { "key": "K1" },
+               "out": "artifacts/written.txt" } ]
+}
+JSON
+out="$(LEARN_SKILLS_ROOT="$SKROOT" $CTL --root "$TMP/jobs" run "$TMP/fix-retry" --input key=K1 2>&1)"; rc=$?
+RIDF="$(run_id_of "$out")"
+[ $rc -eq 3 ] && ok "先停在人闸门（rc=3）" || { bad "期望 rc=3，实际 $rc"; printf '%s\n' "$out" | tail -4; }
+LEARN_SKILLS_ROOT="$SKROOT" $CTL --root "$TMP/jobs" resume "$RIDF" --approve --by selftest >/dev/null 2>&1
+RUNDF="$TMP/jobs/runs/$RIDF"
+# 故意写一份**坏 JSON**（真实踩到的就是：字符串里嵌了未转义的引号）
+printf '{"ok":true,"out":["artifacts/written.txt"],"observations":"他说"保存成功""}' > "$RUNDF/pending/w.result.json"
+out="$(LEARN_SKILLS_ROOT="$SKROOT" $CTL --root "$TMP/jobs" resume "$RIDF" 2>&1)"; rc=$?
+[ $rc -eq 1 ] && printf '%s' "$out" | grep -q '不是合法 JSON' \
+  && ok "坏 JSON 被判为 data 失败并给出可读原因" || { bad "期望 data 失败 rc=1，实际 $rc"; printf '%s\n' "$out" | tail -4; }
+python3 - "$RUNDF/run.json" <<'PY' && ok "失败原因与分类落进 run.json" || bad "失败分类没落盘"
+import json, sys
+st = json.load(open(sys.argv[1], encoding="utf-8"))
+assert st["status"] == "failed", st["status"]
+assert st["steps"]["w"]["class"] == "data", st["steps"]["w"]
+PY
+# 修好结果文件 → 失败的 run 必须能续（这条以前是断的：失败即终态，resume 直接拒绝）
+printf '{"ok":true,"out":["artifacts/written.txt"],"observations":"修好了"}' > "$RUNDF/pending/w.result.json"
+mkdir -p "$RUNDF/artifacts"; printf 'done' > "$RUNDF/artifacts/written.txt"
+out="$(LEARN_SKILLS_ROOT="$SKROOT" $CTL --root "$TMP/jobs" resume "$RIDF" 2>&1)"; rc=$?
+printf '%s' "$out" | grep -q '没有待处理的暂停点' \
+  && bad "修好后 resume 仍被判为「没有暂停点」（失败即终态的 bug 回来了）" \
+  || ok "修好后 resume 不再要求「必须有暂停点」"
+[ $rc -eq 3 ] && [ -f "$RUNDF/pending/w.readback.json" ] \
+  && ok "续跑消费了修好的结果文件并推进到下一阶段（自动进入回读）" \
+  || { bad "期望续上并推进到回读 rc=3，实际 rc=$rc"; printf '%s\n' "$out" | tail -4; }
+python3 - "$TMP/jobs/ledger.jsonl" <<'PY' && ok "重试在账本里留了 run-retry 痕迹（可追溯）" || bad "重试没记账"
+import json, sys
+evs = [json.loads(l) for l in open(sys.argv[1], encoding="utf-8") if l.strip()]
+assert any(e.get("event") == "run-retry" and e.get("failedSteps") == ["w"] for e in evs), [e.get("event") for e in evs]
+PY
+# 反例：**正常暂停**的 run 不许被无脑 resume（不能把「必须有暂停点」这条规矩一起放宽）
+out="$(LEARN_SKILLS_ROOT="$SKROOT" $CTL --root "$TMP/jobs" run "$TMP/fix-retry" --input key=K1 2>&1)"; rc=$?
+[ $rc -eq 3 ] && ok "另起一个 run 仍正常停在闸门" || bad "期望 rc=3，实际 $rc"
+
 # ---------------------------------------------------------------- 7. 知识体检
 head_ "7. 知识体检（把「AI 准不准」变成可测的基线）"
 out="$(LEARN_SKILLS_ROOT="$SKROOT" $CTL --root "$TMP/jobs" audit 2>&1)"; rc=$?
