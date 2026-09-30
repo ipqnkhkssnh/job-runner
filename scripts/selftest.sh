@@ -495,6 +495,27 @@ out="$(LEARN_SKILLS_ROOT="$SKROOT" $CTL --root "$TMP/jobs" resume "$RIDM2" 2>&1)
 [ $rc -eq 1 ] && printf '%s' "$out" | grep -q '回读不一致' \
   && ok "★ MCP 回读不一致被判失败" || { bad "期望 rc=1，实际 $rc"; printf '%s\n' "$out" | tail -4; }
 
+# ---------------------------------------------------------------- 5.2 数值容差判据（金额/库存/配额）
+head_ "5.2 `field_near`：金额类回读不许因 29 vs 29.00 假失败"
+python3 - <<'PY' && ok "field_near 行为正确（容差内通过 / 超差失败 / 缺行失败 / 非数字失败）" || bad "field_near 行为不对"
+import sys, pathlib, tempfile
+sys.path.insert(0, str(pathlib.Path("scripts").resolve()))
+from joblib import invariants as I
+base = pathlib.Path(tempfile.mkdtemp())
+(base / "plans.csv").write_text("plan_id,name,price,contract_count\n44,某套餐,29.00,2\n", encoding="utf-8")
+def chk(**kw):
+    return I.check({"name": "field_near", "path": "plans.csv", **kw}, base, {})
+assert chk(key="name", value="某套餐", field="price", near="29")[0], "29 vs 29.00 应通过"
+assert chk(key="name", value="某套餐", field="price", near="￥29.00 元")[0], "带货币符号应通过"
+assert chk(key="name", value="某套餐", field="contract_count", near="2")[0], "整数列应通过"
+assert not chk(key="name", value="某套餐", field="price", near="30")[0], "超出容差必须失败"
+assert not chk(key="name", value="没有这个", field="price", near="29")[0], "缺行必须失败"
+assert not chk(key="name", value="某套餐", field="name", near="29")[0], "非数字字段必须失败"
+# 引擎与能力卡两侧都认得它
+from joblib.cards import unknown_invariants
+assert unknown_invariants([{"name": "field_near"}]) == [], "能力卡校验器应认识 field_near"
+PY
+
 # ---------------------------------------------------------------- 6. 批量闸门聚合
 head_ "6. 闸门聚合（一批一次确认，而不是逼人点 N 次）"
 mkdir -p "$TMP/batch"

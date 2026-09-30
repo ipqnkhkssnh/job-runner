@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import csv
 import json
+import re
 from pathlib import Path
 
 from .core import JobError
@@ -238,6 +239,53 @@ def inv_field_equals(args, base, ctx):
     return f"回读一致：{key}={want} 的 {field}={got}"
 
 
+def inv_field_near(args, base, ctx):
+    """回读核对（**数值容差版**）：金额 / 库存 / 配额这类值，界面上的显示形态和入参往往不同。
+
+    真实踩点：`套餐价` 入参给 `29`，列表显示 `29.00` —— 字符串等值比较会**假失败**
+    （写其实成功了，判据却报不一致）。所以数值类字段要用 `|实际 - 期望| <= tol` 比。
+    """
+    rows = load_records(args["path"], base)
+    key, want, field = args["key"], args["value"], args["field"]
+    near = args.get("near")
+    tol = float(args.get("tol", 0.005))
+    hit = None
+    for r in rows:
+        if str(_col(r, key)).strip() == str(want).strip():
+            hit = r
+            break
+    if hit is None:
+        raise DataError(
+            f"{args['path']} 里找不到 {key}={want} 的记录——回读没读到目标对象，"
+            f"不能认为写成功了（共 {len(rows)} 行）")
+    raw = str(_col(hit, field)).strip()
+    num = _to_number(raw)
+    if num is None:
+        raise DataError(f"回读无法比对：{key}={want} 的 {field}={raw!r} 不是数字")
+    want_num = _to_number(str(near))
+    if want_num is None:
+        raise DataError(f"判据写错了：near={near!r} 不是数字")
+    if abs(num - want_num) > tol:
+        raise DataError(
+            f"回读不符：{key}={want} 的 {field} 实际 {raw}（{num}），期望 {near}±{tol}"
+            f"（写操作没生效、写错了对象，或被系统回滚）")
+    return f"回读一致：{key}={want} 的 {field}={raw}（≈{near}，容差 {tol}）"
+
+
+def _to_number(s):
+    """把界面上的数值文本转成 float：容忍千分位、货币符号、单位后缀、百分号。"""
+    if s is None:
+        return None
+    t = re.sub(r"[,\s￥¥$元%]", "", str(s))
+    m = re.match(r"^[-+]?\d*\.?\d+", t)
+    if not m:
+        return None
+    try:
+        return float(m.group(0))
+    except ValueError:
+        return None
+
+
 def inv_field_in(args, base, ctx):
     """回读核对（枚举版）：目标记录的 field 必须落在允许集合里。"""
     rows = load_records(args["path"], base)
@@ -285,6 +333,7 @@ REGISTRY = {
     "subset_keys": inv_subset_keys,
     "rows_preserved": inv_rows_preserved,
     "field_equals": inv_field_equals,
+    "field_near": inv_field_near,
     "field_in": inv_field_in,
     "no_duplicate_side_effect": inv_no_duplicate_side_effect,
 }
