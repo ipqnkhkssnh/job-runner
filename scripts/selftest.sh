@@ -64,6 +64,28 @@ RID2="$(run_id_of "$out")"
 [ $rc -eq 0 ] && [ ! -e "$ROOT/runs/$RID2/artifacts/normalized.csv" ] \
   && ok "dry-run 不落地产物" || bad "dry-run 疑似真的执行了"
 
+# 可选入参没传 → 解析成"没有值"（不是引用解析失败），default 生效
+OPTT="$(mktemp -d)"
+mkdir -p "$OPTT/job"
+cat > "$OPTT/job/job.jsonc" <<'JSON'
+{
+  "job": "optional-inputs", "goal": "可选入参没传时不该在引用解析上失败",
+  "inputs": [ { "name": "days", "type": "string", "required": false },
+              { "name": "tag", "type": "string", "required": false, "default": "dft" } ],
+  "steps": [ { "id": "echo", "kind": "tool", "effects": "read",
+               "run": ["python3", "-c", "import sys;open(sys.argv[1],'w').write('|'.join(sys.argv[2:]))",
+                       "${artifacts}/args.txt", "${inputs.days}", "${inputs.tag}"],
+               "out": "artifacts/args.txt" } ]
+}
+JSON
+out="$($CTL --root "$OPTT/jobs" run "$OPTT/job" 2>&1)"; rc=$?
+if [ $rc -eq 0 ] && [ "$(cat "$OPTT/jobs/runs/$(run_id_of "$out")/artifacts/args.txt" 2>/dev/null)" = "|dft" ]; then
+  ok "可选入参没传 → 空值（不再引用解析失败），default 生效"
+else
+  bad "可选入参处理不对，rc=${rc}；$(printf '%s' "$out" | tail -2)"
+fi
+rm -rf "$OPTT"
+
 # ---------------------------------------------------------------- 2. GUI 交接协议
 head_ "2. GUI 交接协议（${EX_B}）"
 out="$($CTL --root "$ROOT" run "$EX_B" --input scope=alpha,beta 2>&1)"; rc=$?
@@ -185,6 +207,262 @@ cat > "$TMP/leak/job.jsonc" <<'JSON'
 JSON
 out="$($CTL --root "$TMP/jobs" validate "$TMP/leak" 2>&1)"; rc=$?
 [ $rc -eq 1 ] && ok "凭据泄漏被拒绝" || bad "凭据检查没生效，rc=$rc"
+
+# ---------------------------------------------------------------- 4. 写闸门与证据阶梯（v2）
+head_ "4. 写闸门真的生效（副作用只能发生在放行之后）"
+SKROOT="$TMP/skills"
+mkdir -p "$SKROOT/demo-write/tasks" "$SKROOT/demo-write/state"
+cat > "$SKROOT/demo-write/SKILL.md" <<'MD'
+---
+name: demo-write
+description: 自测用的假技能，不连任何真实系统。触发词：自测。
+---
+MD
+echo '{"name":"demo-write","version":"0.1.0","origin":"learned-local"}' > "$SKROOT/demo-write/state/meta.json"
+
+# 一张"合格"的写卡：证据等级 + 影响面 + 写后回读
+cat > "$SKROOT/demo-write/tasks/write-thing.json" <<'JSON'
+{
+  "card": "v2", "skill": "demo-write", "task": "write-thing",
+  "title": "写一个东西（自测）", "version": "0.1.0",
+  "system": "demo", "channel": "local-a2desk", "envClass": "test",
+  "effects": "write",
+  "evidenceLevel": "verified-once",
+  "evidenceBasis": "自测里实测成功过一次",
+  "impact": { "blastRadius": "单条记录", "count": 1, "reversible": true },
+  "inputs": [ { "name": "key", "type": "string", "required": true } ],
+  "outputs": [ { "name": "receipt", "path": "artifacts/written.txt", "type": "txt" } ],
+  "readback": { "how": "skill", "use": "demo-write/read-back",
+                "out": "artifacts/readback.csv",
+                "expect": [ { "name": "field_equals", "path": "artifacts/readback.csv",
+                              "key": "key", "value": "${step.inputs.key}",
+                              "field": "status", "equals": "已生效" },
+                            { "name": "field_equals", "path": "artifacts/readback.csv",
+                              "key": "key", "value": "${inputs.key}",
+                              "field": "status", "equals": "已生效" } ] },
+  "selectors": { "page": "demo 页面", "entries": [ { "step": 1, "by": "button", "text": "保存" } ] }
+}
+JSON
+cat > "$SKROOT/demo-write/tasks/read-back.json" <<'JSON'
+{
+  "card": "v2", "skill": "demo-write", "task": "read-back",
+  "title": "回读（自测）", "version": "0.1.0", "system": "demo",
+  "channel": "local-a2desk", "envClass": "test", "effects": "read",
+  "outputs": [ { "name": "rb", "path": "artifacts/readback.csv", "type": "csv" } ],
+  "selectors": { "page": "demo 页面", "entries": [ { "step": 1, "by": "button", "text": "查询" } ] }
+}
+JSON
+out="$(LEARN_SKILLS_ROOT="$SKROOT" $CTL --root "$TMP/jobs" card demo-write/write-thing 2>&1)"; rc=$?
+[ $rc -eq 0 ] && ok "合格写卡通过 jobctl card 校验" \
+  || { bad "写卡校验失败，rc=$rc"; printf '%s\n' "$out" | tail -5; }
+
+# 4.1 写 tool 步骤：放行之前不许产生副作用
+mkdir -p "$TMP/gate-write"
+cat > "$TMP/gate-write/job.jsonc" <<'JSON'
+{
+  "job": "gate-write", "goal": "写操作必须等人工放行后才执行",
+  "inputs": [], "requires": { "env": { "class": "test" } },
+  "steps": [ { "id": "mk", "kind": "tool", "effects": "write", "gate": "approve",
+               "idempotency": "gate-write:fixed",
+               "run": ["python3", "-c", "import pathlib,sys; p=pathlib.Path(sys.argv[1]); p.parent.mkdir(parents=True,exist_ok=True); p.write_text('done')", "${artifacts}/written.txt"],
+               "out": "artifacts/written.txt" } ]
+}
+JSON
+out="$($CTL --root "$TMP/jobs" run "$TMP/gate-write" 2>&1)"; rc=$?
+RIDG="$(run_id_of "$out")"
+[ $rc -eq 3 ] && ok "写操作在执行前暂停等人放行（rc=3）" || bad "期望 rc=3，实际 $rc"
+[ ! -f "$TMP/jobs/runs/$RIDG/artifacts/written.txt" ] \
+  && ok "★ 放行之前副作用没有发生（产物不存在）" \
+  || bad "★ 未放行就产生了副作用——闸门是假的"
+printf '%s' "$out" | grep -q 'phase: gate' && ok "暂停指令标明 gate 阶段与影响面" || bad "指令缺少 phase=gate"
+out="$($CTL --root "$TMP/jobs" resume "$RIDG" --approve --by selftest 2>&1)"; rc=$?
+[ $rc -eq 0 ] && ok "放行后才执行，run 正常完成" || { bad "放行后失败 rc=$rc"; printf '%s\n' "$out" | tail -5; }
+[ -f "$TMP/jobs/runs/$RIDG/artifacts/written.txt" ] && ok "放行后副作用落地" || bad "放行后没有产物"
+
+# 4.1b 推演不许毒化幂等键：dry-run 过的写作业，真跑时**必须**重新停闸门并真的执行
+DRYDIR="$(mktemp -d)"; mkdir -p "$DRYDIR/job"
+cat > "$DRYDIR/job/job.jsonc" <<'JSON'
+{
+  "job": "dry-then-real", "goal": "推演过的写作业真跑时不许被幂等跳过",
+  "inputs": [], "requires": { "env": { "class": "test" } },
+  "steps": [ { "id": "w", "kind": "tool", "effects": "write", "gate": "approve",
+               "idempotency": "dry-then-real:fixed",
+               "run": ["python3", "-c", "import pathlib,sys; p=pathlib.Path(sys.argv[1]); p.parent.mkdir(parents=True,exist_ok=True); p.write_text('done')", "${artifacts}/w.txt"],
+               "out": "artifacts/w.txt" } ]
+}
+JSON
+$CTL --root "$DRYDIR/jobs" run "$DRYDIR/job" --dry-run >/dev/null 2>&1
+out="$($CTL --root "$DRYDIR/jobs" run "$DRYDIR/job" 2>&1)"; rc=$?
+RIDD="$(run_id_of "$out")"
+if [ $rc -eq 3 ] && [ ! -f "$DRYDIR/jobs/runs/$RIDD/artifacts/w.txt" ]; then
+  ok "★ 推演过的写作业，真跑仍会停闸门（未被幂等键毒化）"
+else
+  bad "★ dry-run 毒化了幂等键：真跑被跳过或未拦闸门（rc=$rc）"
+fi
+out="$($CTL --root "$DRYDIR/jobs" resume "$RIDD" --approve --by selftest 2>&1)"; rc=$?
+[ $rc -eq 0 ] && [ -f "$DRYDIR/jobs/runs/$RIDD/artifacts/w.txt" ] \
+  && ok "推演后的真跑在放行后确实执行了" || bad "真跑没执行（rc=$rc）"
+grep -q '"event": "dry-run-skip"' "$DRYDIR/jobs/ledger.jsonl" \
+  && ok "推演只留 dry-run-skip 痕迹，不写 side-effect" || bad "推演痕迹不对"
+rm -rf "$DRYDIR"
+
+# 4.2 写卡缺证据等级/影响面/回读 → validate 必须报错
+cat > "$SKROOT/demo-write/tasks/write-noev.json" <<'JSON'
+{
+  "card": "v2", "skill": "demo-write", "task": "write-noev",
+  "title": "没写证据等级的写卡", "version": "0.1.0", "system": "demo",
+  "channel": "local-a2desk", "envClass": "test", "effects": "write",
+  "outputs": [ { "name": "r", "path": "artifacts/x.txt", "type": "txt" } ]
+}
+JSON
+mkdir -p "$TMP/no-ev"
+cat > "$TMP/no-ev/job.jsonc" <<'JSON'
+{
+  "job": "no-ev", "goal": "负例：写路径必须声明证据等级",
+  "inputs": [], "requires": { "env": { "class": "test" } },
+  "steps": [ { "id": "w", "kind": "skill", "use": "demo-write/write-noev",
+               "effects": "write", "gate": "approve", "idempotency": "no-ev:1",
+               "out": "artifacts/x.txt" } ]
+}
+JSON
+out="$(LEARN_SKILLS_ROOT="$SKROOT" $CTL --root "$TMP/jobs" validate "$TMP/no-ev" 2>&1)"; rc=$?
+[ $rc -eq 1 ] && ok "写卡缺 evidenceLevel/impact/readback 被拒绝" || bad "期望 rc=1，实际 $rc"
+printf '%s' "$out" | grep -q 'evidenceLevel' && ok "错误信息点明了缺口是证据等级" || bad "错误信息不明确"
+printf '%s' "$out" | grep -q 'readback' && ok "错误信息点明了缺回读判据" || bad "没提到 readback"
+
+# 4.3 只到 observed 的写卡放进批量 → validate 必须报错
+cat > "$SKROOT/demo-write/tasks/write-observed.json" <<'JSON'
+{
+  "card": "v2", "skill": "demo-write", "task": "write-observed",
+  "title": "只在录屏里看到过的写卡", "version": "0.1.0", "system": "demo",
+  "channel": "local-a2desk", "envClass": "test", "effects": "write",
+  "evidenceLevel": "observed", "evidenceBasis": "录屏 f018，未实操",
+  "impact": { "blastRadius": "单条记录", "count": 1, "reversible": true },
+  "selectors": { "page": "demo 页面", "entries": [ { "step": 1, "by": "button", "text": "保存" } ] },
+  "outputs": [ { "name": "r", "path": "artifacts/o/${item}.txt", "type": "txt" } ],
+  "readback": { "how": "tool", "run": ["python3", "-c", "print('rb')"],
+                "out": "artifacts/o/${item}.txt",
+                "expect": [ { "name": "not_empty", "path": "artifacts/o/${item}.txt" } ] }
+}
+JSON
+mkdir -p "$TMP/batch-observed"
+cat > "$TMP/batch-observed/job.jsonc" <<'JSON'
+{
+  "job": "batch-observed", "goal": "负例：证据不足的写路径禁止批量",
+  "inputs": [], "requires": { "env": { "class": "test" } },
+  "steps": [ { "id": "many", "kind": "map", "for_each": ["a", "b"],
+               "steps": [ { "id": "w", "kind": "skill", "use": "demo-write/write-observed",
+                            "effects": "write", "gate": "approve",
+                            "idempotency": "obs:${item}",
+                            "out": "artifacts/o/${item}.txt" } ] } ]
+}
+JSON
+out="$(LEARN_SKILLS_ROOT="$SKROOT" $CTL --root "$TMP/jobs" validate "$TMP/batch-observed" 2>&1)"; rc=$?
+[ $rc -eq 1 ] && ok "★ 只到 observed 的写路径被禁止批量执行" || bad "期望 rc=1，实际 $rc"
+printf '%s' "$out" | grep -q '批量' && ok "错误信息说明了批量会放大错误" || bad "没说清原因"
+
+# 4.4 低报副作用（卡片是 write，步骤写 read）→ validate 必须报错
+mkdir -p "$TMP/under-report"
+cat > "$TMP/under-report/job.jsonc" <<'JSON'
+{
+  "job": "under-report", "goal": "负例：不许低报副作用绕过闸门",
+  "inputs": [], "requires": { "env": { "class": "test" } },
+  "steps": [ { "id": "w", "kind": "skill", "use": "demo-write/write-thing",
+               "effects": "read", "gate": "auto", "inputs": { "key": "K" },
+               "out": "artifacts/written.txt" } ]
+}
+JSON
+out="$(LEARN_SKILLS_ROOT="$SKROOT" $CTL --root "$TMP/jobs" validate "$TMP/under-report" 2>&1)"; rc=$?
+[ $rc -eq 1 ] && ok "低报副作用（write 卡写成 read 步骤）被拒绝" || bad "期望 rc=1，实际 $rc"
+printf '%s' "$out" | grep -q '低报' && ok "错误信息点明了低报" || bad "错误信息不明确"
+
+# ---------------------------------------------------------------- 5. 写后回读（两阶段）
+head_ "5. 写后强制回读（没有 API 的系统里唯一的数据层判据）"
+mkdir -p "$TMP/readback"
+cat > "$TMP/readback/job.jsonc" <<'JSON'
+{
+  "job": "readback-flow", "goal": "写完之后必须回读核对，不许只看提示条",
+  "inputs": [ { "name": "key", "type": "string", "required": true } ],
+  "requires": { "env": { "class": "test" }, "skills": [ { "name": "demo-write" } ] },
+  "steps": [ { "id": "w", "kind": "skill", "use": "demo-write/write-thing",
+               "effects": "write", "gate": "approve",
+               "idempotency": "rb:${inputs.key}",
+               "inputs": { "key": "${inputs.key}" },
+               "out": "artifacts/written.txt" } ]
+}
+JSON
+RIDR=""
+out="$(LEARN_SKILLS_ROOT="$SKROOT" $CTL --root "$TMP/jobs" run "$TMP/readback" --input key=K1 2>&1)"; rc=$?
+RIDR="$(run_id_of "$out")"
+[ $rc -eq 3 ] && ok "写步骤先停在人闸门（rc=3）" || bad "期望 rc=3，实际 $rc"
+out="$(LEARN_SKILLS_ROOT="$SKROOT" $CTL --root "$TMP/jobs" resume "$RIDR" --approve --by selftest 2>&1)"; rc=$?
+[ $rc -eq 3 ] && ok "放行后停在执行阶段（等 agent 干活）" || bad "期望 rc=3，实际 $rc"
+RUND="$TMP/jobs/runs/$RIDR"
+printf '{"ok":true,"out":["artifacts/written.txt"],"observations":"界面显示保存成功"}' > "$RUND/pending/w.result.json"
+mkdir -p "$RUND/artifacts"; printf 'done' > "$RUND/artifacts/written.txt"
+out="$(LEARN_SKILLS_ROOT="$SKROOT" $CTL --root "$TMP/jobs" resume "$RIDR" 2>&1)"; rc=$?
+[ $rc -eq 3 ] && ok "★ 写完不停：自动进入写后回读阶段" || bad "期望进入回读阶段 rc=3，实际 $rc"
+[ -f "$RUND/pending/w.readback.json" ] && ok "落下了 readback 指令（含 expect 判据）" || bad "没有 readback 指令"
+printf '%s' "$out" | grep -q 'phase: readback' && ok "指令标明 phase=readback" || bad "指令阶段不对"
+# 回读说"没生效" → 必须判失败
+printf '{"ok":true,"out":["artifacts/readback.csv"],"observations":"status=未生效"}' > "$RUND/pending/w.readback.result.json"
+printf 'key,status\nK1,未生效\n' > "$RUND/artifacts/readback.csv"
+out="$(LEARN_SKILLS_ROOT="$SKROOT" $CTL --root "$TMP/jobs" resume "$RIDR" 2>&1)"; rc=$?
+[ $rc -eq 1 ] && ok "★ 回读不一致被判失败（rc=1，不是『看到成功提示』就算过）" || bad "期望 rc=1，实际 $rc"
+printf '%s' "$out" | grep -q '回读' && ok "失败归因指向回读" || bad "归因不明确"
+# 换一个 run：回读一致 → 完成
+out="$(LEARN_SKILLS_ROOT="$SKROOT" $CTL --root "$TMP/jobs" run "$TMP/readback" --input key=K2 2>&1)"
+RIDR2="$(run_id_of "$out")"
+LEARN_SKILLS_ROOT="$SKROOT" $CTL --root "$TMP/jobs" resume "$RIDR2" --approve >/dev/null 2>&1
+RUND2="$TMP/jobs/runs/$RIDR2"
+LEARN_SKILLS_ROOT="$SKROOT" $CTL --root "$TMP/jobs" resume "$RIDR2" >/dev/null 2>&1
+printf '{"ok":true,"out":["artifacts/written.txt"],"observations":"保存成功"}' > "$RUND2/pending/w.result.json"
+printf 'done' > "$RUND2/artifacts/written.txt"
+LEARN_SKILLS_ROOT="$SKROOT" $CTL --root "$TMP/jobs" resume "$RIDR2" >/dev/null 2>&1
+printf '{"ok":true,"out":["artifacts/readback.csv"],"observations":"status=已生效"}' > "$RUND2/pending/w.readback.result.json"
+printf 'key,status\nK2,已生效\n' > "$RUND2/artifacts/readback.csv"
+out="$(LEARN_SKILLS_ROOT="$SKROOT" $CTL --root "$TMP/jobs" resume "$RIDR2" 2>&1)"; rc=$?
+[ $rc -eq 0 ] && ok "回读一致 → run 完成" || { bad "期望 rc=0，实际 $rc"; printf '%s\n' "$out" | tail -4; }
+grep -q 'field_equals' "$RUND2/report.md" 2>/dev/null && ok "回读判据进了报告（可审计）" \
+  || bad "报告里没有回读判据"
+
+# ---------------------------------------------------------------- 6. 批量闸门聚合
+head_ "6. 闸门聚合（一批一次确认，而不是逼人点 N 次）"
+mkdir -p "$TMP/batch"
+cat > "$TMP/batch/job.jsonc" <<'JSON'
+{
+  "job": "batch-gate", "goal": "一次放行一批对象",
+  "inputs": [], "requires": { "env": { "class": "test" } },
+  "steps": [ { "id": "review", "kind": "approve", "effects": "read", "batch": true,
+               "items": ["A", "B", "C"],
+               "impact": { "blastRadius": "3 个对象", "reversible": false,
+                           "note": "回退要人工改回来" },
+               "message": "即将对 A/B/C 执行变更，确认？" } ]
+}
+JSON
+out="$($CTL --root "$TMP/jobs" run "$TMP/batch" 2>&1)"; rc=$?
+RIDB2="$(run_id_of "$out")"
+[ $rc -eq 3 ] && ok "批量闸门暂停等人（rc=3）" || bad "期望 rc=3，实际 $rc"
+printf '%s' "$out" | grep -q 'itemCount' && ok "放行卡里带了 itemCount（人知道自己在批几件）" \
+  || bad "放行卡缺影响面"
+printf '%s' "$out" | grep -q 'only' && ok "给了部分放行的命令提示" || bad "没有部分放行的用法提示"
+out="$($CTL --root "$TMP/jobs" resume "$RIDB2" --approve --only A,C --by selftest 2>&1)"; rc=$?
+[ $rc -eq 0 ] && ok "部分放行后续跑完成" || { bad "rc=$rc"; printf '%s\n' "$out" | tail -4; }
+python3 - "$TMP/jobs/runs/$RIDB2/run.json" <<'PY' && ok "放行/驳回清单落进 run.json 供下游消费" \
+  || bad "部分放行的清单没落进 run.json"
+import json, sys
+st = json.load(open(sys.argv[1], encoding="utf-8"))
+ex = st["steps"]["review"].get("extra") or {}
+assert ex.get("approvedItems") == ["A", "C"], ex
+assert ex.get("rejectedItems") == ["B"], ex
+PY
+
+# ---------------------------------------------------------------- 7. 知识体检
+head_ "7. 知识体检（把「AI 准不准」变成可测的基线）"
+out="$(LEARN_SKILLS_ROOT="$SKROOT" $CTL --root "$TMP/jobs" audit 2>&1)"; rc=$?
+[ $rc -eq 0 ] && ok "jobctl audit 能跑" || bad "audit 失败 rc=$rc"
+printf '%s' "$out" | grep -q '禁止批量\|单件' && ok "体检结论指出了证据不足的写路径" || bad "体检结论没抓到风险"
+printf '%s' "$out" | grep -q '缺卡' && ok "体检能报出「缺能力卡」这种断链" || bad "体检漏报了缺卡"
 
 rm -rf "$TMP"
 

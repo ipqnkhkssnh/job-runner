@@ -12,7 +12,8 @@
   jobctl.py gaps     <run-id> [--brief]     # 缺口清单（--brief 给 learn-skill 的补学单）
   jobctl.py list                            # 作业登记表
   jobctl.py new      <name>                 # 从模板建一个 job 骨架
-  jobctl.py card     <skill>/<task>         # 解析并校验一张能力卡
+  jobctl.py card     <skill>/<task>         # 解析并校验一张能力卡（含证据等级/影响面/回读）
+  jobctl.py audit    [--json]               # 知识体检：哪些任务能自动、哪些必须先实测
   jobctl.py schema                          # 打印规范文档路径与 kind 列表
 
 退出码：0 成功 / 1 失败或校验不通过 / 2 用法错误 / 3 暂停（等人或 agent 接手）
@@ -31,8 +32,8 @@ from joblib import cards as cards_mod            # noqa: E402
 from joblib import core                          # noqa: E402
 from joblib import validate as validate_mod      # noqa: E402
 from joblib.core import (FAIL_EXIT, KINDS, OK_EXIT, PAUSE_EXIT, USAGE_EXIT,  # noqa: E402
-                         JobError, jobs_root, now_iso, read_json, skills_root,
-                         write_json)
+                         EVIDENCE_LEVELS, EVIDENCE_MEANING, JobError, evidence_at_least,
+                         jobs_root, now_iso, read_json, skills_root, write_json)
 from joblib.runner import Runner, load_inputs    # noqa: E402
 
 SKILL_DIR = Path(__file__).resolve().parent.parent
@@ -54,6 +55,14 @@ def _color(s, c):
     return f"{c}{s}{C_OFF}" if sys.stdout.isatty() else s
 
 
+def _split_list(v):
+    """「a,b,c」/ ["a","b"] → ["a","b","c"]（空 → []）。"""
+    if not v:
+        return []
+    parts = v if isinstance(v, (list, tuple)) else str(v).split(",")
+    return [str(x).strip() for x in parts if str(x).strip()]
+
+
 # ---------------------------------------------------------------- validate
 
 def cmd_validate(args):
@@ -73,9 +82,18 @@ def cmd_validate(args):
         for s in info["steps"]:
             say(f"  {s['path']:<28} {s['kind']:<8} effects={s['effects']:<12} gate={s['gate']}")
     if info.get("cards"):
-        head("能力卡")
+        head("能力卡（证据等级决定它能不能被自动执行）")
         for c in info["cards"]:
-            say(f"  {c['step']}: {c['skill']}/{c['task']} v{c['version']}  ({c['path']})")
+            say(f"  {c['step']}: {c['skill']}/{c['task']} v{c['version']}  "
+                f"effects={c.get('effects')} 证据={c.get('evidenceLevel')}  "
+                f"通道={c.get('channel')}  回读={'有' if c.get('readback') else '无'}")
+            imp = c.get("impact") or {}
+            if imp:
+                say(f"      影响面：{imp.get('blastRadius', '?')}"
+                    f"　可回退={'是' if imp.get('reversible') else '否/未知'}"
+                    f"　{c.get('path')}")
+            elif c.get("path"):
+                say(f"      {c['path']}")
     if info.get("skills"):
         head("依赖技能")
         for k, v in info["skills"].items():
@@ -146,19 +164,39 @@ def cmd_resume(args):
         say(_color("! job 定义在本次 run 之后被改过（hash 不一致）：续跑会用新定义，"
                    "若改的是结构请新开一次 run。", C_WARN))
 
-    # 人闸门快捷放行
+    # 人闸门快捷放行（也用于写闸门 gate 与批量放行）
     pause = st.get("pause") or {}
-    if (args.approve or args.reject) and pause:
-        rfile = Path(st["jobDir"]) if False else (root / "runs" / args.run_id /
-                                                  pause.get("resultFile", "pending/x.result.json"))
+    wants_decision = bool(args.approve or args.reject or args.only or args.reject_items)
+    if wants_decision and pause:
         if not pause.get("resultFile"):
             say(_color("✗ 这个暂停点没有 resultFile，无法用 --approve 放行", C_ERR))
             return USAGE_EXIT
-        write_json(rfile, {"approved": bool(args.approve) and not args.reject,
-                           "ok": bool(args.approve) and not args.reject,
-                           "by": args.by or "user", "note": args.note or "",
-                           "at": now_iso()})
+        rfile = root / "runs" / args.run_id / pause["resultFile"]
+        approved = bool(args.approve) and not args.reject
+        payload = {"by": args.by or "user", "note": args.note or "", "at": now_iso()}
+        items = pause.get("items") or []
+        only = _split_list(args.only)
+        reject_items = _split_list(args.reject_items)
+        if (only or reject_items) and items:
+            # 批量闸门的部分放行：一次决定里明确"放哪些 / 驳哪些"，
+            # 下游步骤用 ${steps.<id>.approvedItems} / .rejectedItems 消费
+            rejected = [i for i in items if str(i) in {str(x) for x in reject_items}]
+            if only:
+                keep = {str(x) for x in only}
+                rejected += [i for i in items
+                             if str(i) not in keep and i not in rejected]
+            approved_items = [i for i in items if i not in rejected]
+            approved = bool(approved_items) and not args.reject
+            payload["approvedItems"] = approved_items
+            payload["rejectedItems"] = rejected
+            say(f"部分放行：放行 {len(approved_items)} 项，驳回 {len(rejected)} 项")
+        payload["approved"] = approved
+        payload["ok"] = approved
+        write_json(rfile, payload)
         say(f"已写入放行结果：{rfile}")
+
+    if (args.only or args.reject_items) and not pause:
+        say(_color("! --only/--reject-items 只在批量闸门的暂停点上有意义", C_WARN))
 
     runner = Runner(job, jdir, jf, st.get("inputs") or {}, root, sroot,
                     run_id=args.run_id, dry_run=bool(st.get("dryRun")),
@@ -191,8 +229,10 @@ def _report_result(res, runner: Runner):
         d = res.get("directive") or {}
         say(_color(f"⏸ 暂停（等 {res.get('what')}）：{res.get('message')}", C_WARN))
         head("待办指令")
-        for k in ("instruction", "message", "capability", "expect", "evidenceDir",
-                  "resultFile", "howToApprove", "howToReject", "resumeCmd"):
+        for k in ("instruction", "message", "phase", "channel", "capability", "evidence",
+                  "impact", "items", "itemCount", "readback", "expect", "evidenceDir",
+                  "resultFile", "howToApprove", "howToReject",
+                  "howToApprovePartially", "howToRejectSome", "resumeCmd"):
             if d.get(k):
                 v = d[k]
                 say(f"  {k}: {json.dumps(v, ensure_ascii=False)[:400] if not isinstance(v, str) else v}")
@@ -368,6 +408,26 @@ def cmd_card(args):
     errs = cards_mod.validate_card(card, path)
     say(f"能力卡: {skill}/{task}  v{card.get('version')}  来源: {path or 'inline'}")
     say(f"通道: {card.get('channel')}　环境: {card.get('envClass')}　副作用: {card.get('effects')}")
+    if card.get("channel") == "mcp":
+        say(f"  MCP: {json.dumps(card.get('mcp') or {}, ensure_ascii=False)}"
+            f"（优先直接调工具，不去点界面）")
+    ev = card.get("evidenceLevel")
+    if ev:
+        say(f"证据等级: {ev}")
+        say(f"  含义: {EVIDENCE_MEANING.get(ev, '')}")
+        if card.get("evidenceBasis"):
+            say(f"  依据: {card['evidenceBasis']}")
+    elif card.get("effects") not in (None, "read"):
+        say(_color("证据等级: （缺失——写路径必须声明，否则编排侧无法判断该信到什么程度）", C_WARN))
+    imp = card.get("impact")
+    if imp:
+        say(f"影响面: {json.dumps(imp, ensure_ascii=False)}")
+    rb = card.get("readback")
+    if rb:
+        say(f"写后回读: how={rb.get('how')} use={rb.get('use')}"
+            f" expect={len(rb.get('expect') or [])} 条判据")
+    elif card.get("effects") not in (None, "read"):
+        say(_color("写后回读: （无——只能靠界面提示条判断成败）", C_WARN))
     head("输入")
     for i in card.get("inputs") or []:
         say(f"  {i.get('name')} ({i.get('type', 'string')}){' 必填' if i.get('required') else ''} - {i.get('desc', '')}")
@@ -391,8 +451,106 @@ def cmd_schema(args):
     say(f"规范文档: {SKILL_DIR / 'references' / 'job-format.md'}")
     say(f"步骤类型: {', '.join(KINDS)}")
     say("副作用等级: read / write / outbound / irreversible（写以上必须人工闸门）")
+    say("闸门: auto / approve / outbound（approve 现在由引擎**真正执行**：副作用发生前拦人）")
+    say("证据等级: " + " < ".join(EVIDENCE_LEVELS) + "（写路径的卡必须声明）")
+    say("  " + "；".join(f"{k}={v.split('——')[0]}" for k, v in EVIDENCE_MEANING.items()))
+    say("通道优先级: mcp > api > remote-a2desk > local-a2desk > playwright > human")
+    say("写路径必填: evidenceLevel（多可信）+ impact（波及多大）+ readback（拿什么回读核对）")
     say("失效分类: env / knowledge / data / unknown（只有 knowledge 回写 learn-skill）")
     say("job 定义文件名: job.jsonc（推荐，支持注释与尾逗号） / job.json / job.yaml（需 PyYAML）")
+    return OK_EXIT
+
+
+# ---------------------------------------------------------------- audit（知识体检）
+
+def _iter_skill_cards(sroot: Path):
+    """遍历技能根，产出每个任务的卡片状态（缺卡的也算一条，那本身就是结论）。"""
+    rows = []
+    if not sroot.is_dir():
+        return rows
+    for sdir in sorted(p for p in sroot.iterdir() if p.is_dir()):
+        if not (sdir / "SKILL.md").is_file():
+            continue
+        meta = read_json(sdir / "state" / "meta.json", default=None) or {}
+        tdir = sdir / "tasks"
+        # 任务名取 .md 与 .json 的并集：只有配方没卡、或只有卡没配方，都是要报出来的断链
+        stems = set()
+        if tdir.is_dir():
+            stems |= {p.stem for p in tdir.glob("*.md") if p.name != "README.md"}
+            stems |= {p.stem for p in tdir.glob("*.json") if not p.name.startswith("_")}
+        cards = {p.stem: p for p in tdir.glob("*.json") if not p.name.startswith("_")} \
+            if tdir.is_dir() else {}
+        sel = (sdir / "pages" / "selectors.json").is_file()
+        for name in sorted(stems):
+            t = tdir / f"{name}.md"
+            cpath = cards.get(name)
+            row = {"skill": sdir.name, "task": name, "card": bool(cpath),
+                   "recipe": t.is_file(),
+                   "selectors": sel, "effects": None, "evidenceLevel": None,
+                   "impact": None, "readback": False, "channel": None,
+                   "verdict": "无卡：job-runner 会在此暂停并记为 knowledge 缺口"}
+            if cpath and not t.is_file():
+                row["verdict"] = "有卡但缺人读配方（tasks/<task>.md）"
+            if cpath:
+                try:
+                    card = read_json(cpath)
+                except Exception as exc:  # noqa: BLE001
+                    row["verdict"] = f"卡片不是合法 JSON：{exc}"
+                    rows.append(row)
+                    continue
+                row["effects"] = card.get("effects", "read")
+                row["evidenceLevel"] = card.get("evidenceLevel")
+                row["impact"] = (card.get("impact") or {}).get("blastRadius")
+                row["readback"] = bool(card.get("readback"))
+                row["channel"] = card.get("channel")
+                errs = cards_mod.validate_card(card, cpath)
+                if errs:
+                    row["verdict"] = f"卡片不合格（{len(errs)} 项）：{errs[0][:60]}"
+                elif row["effects"] == "read":
+                    row["verdict"] = "可自动执行（只读）"
+                elif row["evidenceLevel"] == "unknown":
+                    row["verdict"] = "禁止编排（写路径未实测）"
+                elif row["evidenceLevel"] == "observed":
+                    row["verdict"] = "仅单件 + 人闸门（未实测，禁止批量）"
+                elif row["evidenceLevel"] == "verified-once":
+                    row["verdict"] = "人闸门下可执行（批量需逐批放行）"
+                else:
+                    row["verdict"] = "人闸门下可批量"
+                if not row["readback"] and row["effects"] != "read":
+                    row["verdict"] += "；缺回读判据"
+            rows.append(row)
+        if not stems:
+            rows.append({"skill": sdir.name, "task": "（无任务配方）", "card": False,
+                         "recipe": False,
+                         "selectors": sel, "effects": None, "evidenceLevel": None,
+                         "impact": None, "readback": False, "channel": None,
+                         "verdict": "技能包里没有 tasks/*.md"})
+    return rows
+
+
+def cmd_audit(args):
+    sroot = skills_root()
+    rows = _iter_skill_cards(sroot)
+    if args.json:
+        say(json.dumps({"skillsRoot": str(sroot), "rows": rows}, ensure_ascii=False, indent=2))
+        return OK_EXIT
+    say(f"技能根: {sroot}")
+    head("任务知识体检（这才是「AI 可能不准」的可测基线）")
+    say(f"  {'技能':<30} {'任务':<34} {'副作用':<13} {'证据':<16} {'回读':<5} 结论")
+    for r in rows:
+        say(f"  {r['skill']:<30} {r['task']:<34} {str(r['effects'] or '-'):<13} "
+            f"{str(r['evidenceLevel'] or '-'):<16} "
+            f"{('有' if r['readback'] else '-'):<5} {r['verdict']}")
+    total = len(rows)
+    with_card = sum(1 for r in rows if r["card"])
+    writes = [r for r in rows if r["effects"] and r["effects"] != "read"]
+    covered = [r for r in writes if r["readback"]]
+    head("汇总")
+    say(f"  任务 {total} 个，其中 {with_card} 个有机器读的能力卡"
+        f"（{total - with_card} 个缺卡 → 编排会暂停等补学）")
+    say(f"  写路径 {len(writes)} 条，其中 {sum(1 for r in writes if r['evidenceLevel'])} 条声明了证据等级，"
+        f"{len(covered)} 条有回读判据")
+    say(f"  selectors.json: {sum(1 for r in rows if r['selectors'])}/{total} 个技能有语义定位器")
     return OK_EXIT
 
 
@@ -420,6 +578,9 @@ def build_parser():
     s.add_argument("run_id")
     s.add_argument("--approve", action="store_true", help="人闸门：放行")
     s.add_argument("--reject", action="store_true", help="人闸门：驳回")
+    s.add_argument("--only", help="批量闸门：只放行这些条目（逗号分隔）")
+    s.add_argument("--reject-items", dest="reject_items",
+                   help="批量闸门：驳回这些条目，其余放行（逗号分隔）")
     s.add_argument("--by", help="放行人")
     s.add_argument("--note", help="备注")
     s.add_argument("--ignore-done", action="store_true")
@@ -457,6 +618,10 @@ def build_parser():
 
     sc = sub.add_parser("schema", help="打印规范位置")
     sc.set_defaults(fn=cmd_schema)
+
+    au = sub.add_parser("audit", help="知识体检：每个任务的卡片/证据等级/回读覆盖")
+    au.add_argument("--json", action="store_true", help="输出 JSON")
+    au.set_defaults(fn=cmd_audit)
     return p
 
 

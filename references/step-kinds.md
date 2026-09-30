@@ -54,15 +54,20 @@
 
 引擎**不自己驱动界面**（skill 不是新工具类型，MCP 由 agent 调）。流程是：
 
-1. 引擎解析能力卡 → 落 `pending/<step>.json`：
+1. **写闸门先行**（`effects != read` 且 `gate: approve` 时）：引擎先落 `pending/<step>.gate.json`
+   并退出码 3——**副作用发生之前**就要人放行，放行卡里带着证据等级、影响面和将要写什么。
+   被驳回 → 步骤失败，什么都不做。
+2. 引擎解析能力卡 → 落 `pending/<step>.json`：
    - `capability`：卡片全文（含 `selectors` / `steps` / `automationBoundary`）；
-   - `expect`：要产出的 `out`、要满足的 `verify`；
+   - `expect`：要产出的 `out`、要满足的 `verify`、写路径还会带上 `readback`；
+   - `evidence`：这张卡的证据等级 + 影响面（人/agent 都看得到自己在动多危险的东西）；
+   - `channel`：`preferred` + 优先级表 + （如果有）`mcp` 工具名——**有 mcp/api 就别点界面**；
    - `evidenceDir` / `resultFile` / `resumeCmd`；
-   - `safety`：effects/gate 与「写操作需授权」的提醒。
-2. **退出码 3**，把控制权交给 agent。
-3. agent 按 `learn-skill` §3 的通道优先级操作（remote-a2desk → local-a2desk → playwright），
+   - `safety`：effects/gate/是否已放行。
+3. **退出码 3**，把控制权交给 agent。
+4. agent 按 §5 的通道优先级操作（mcp → api → remote-a2desk → local-a2desk → playwright → human），
    **每步先截图 → 操作 → 再截图**，截图写进 `evidenceDir`。
-4. agent 写 `resultFile`：
+5. agent 写 `resultFile`：
 
 ```jsonc
 {
@@ -77,13 +82,35 @@
   "note": "给下一次执行的提示"
 }
 ```
-5. `jobctl resume <run-id>`：引擎校验产物存在 → 跑该步骤的 `verify` → 继续。
+6. `jobctl resume <run-id>`：引擎校验产物存在 → 跑该步骤的 `verify` → 继续。
+7. **写路径还有第三阶段**：如果能力卡声明了 `readback`，引擎**不会**在这里收工，
+   而是再落一份 `pending/<step>.readback.json` 并再退出码 3，要求重新读一次刚改的对象：
+
+```jsonc
+// pending/<step>.readback.json（引擎生成）
+{
+  "phase": "readback",
+  "instruction": "写操作已经执行。现在做写后回读：只读方式重新查一次，逐项比对期望值……",
+  "readback": { "how": "skill", "use": "some-platform/query-device",
+                "expect": [ { "name": "field_equals", "path": "artifacts/readback.csv",
+                              "key": "sn", "value": "${item}",
+                              "field": "gps", "equals": "开启" } ] },
+  "resultFile": "pending/<step>.readback.result.json",
+  "resultSchema": { "ok": "...", "out": ["回读产物的相对路径"],
+                    "matches": [ { "field": "...", "expected": "...", "actual": "...", "ok": true } ] }
+}
+```
+
+   回读产物再跑一遍 `expect` 里的不变量：**不通过就判 `data` 失败**。
+   这一条的意义是：没有 API 的系统拿不到数据层，只能靠「重新读一次 + 比对字段值」当判据——
+   比「界面上弹了个成功提示条」硬得多。写没生效、写错对象、被系统回滚，都会在这里露出来。
 
 **能力卡不存在时不是失败，是知识缺口**：引擎在同一位置暂停，
 指令里告诉 agent「去用 learn-skill 模式 B 补学、产出 `<skill>/tasks/<task>.json`」，
 并记一条 `knowledge` 缺口。补完卡片直接 `resume`，引擎重新解析，不用重跑整个 job。
 
-**禁止**：在 job 里写裸坐标、写死界面文案的顺序、把登录凭据写进 job 或卡片。
+**禁止**：在 job 里写裸坐标、写死界面文案的顺序、把登录凭据写进 job 或卡片、
+把 `effects` 低报成 `read` 来绕过闸门（validate 会拒，引擎也会取更严的那个）。
 
 ---
 
@@ -154,7 +181,7 @@
 
 ---
 
-## 5. `approve` —— 人闸门
+## 5. `approve` —— 人闸门（含批量放行）
 
 ```jsonc
 { "id": "signoff", "kind": "approve", "effects": "read",
@@ -164,6 +191,35 @@
 
 暂停后 agent 应把 `message` **原样**念给用户，拿到明确答复再
 `jobctl resume <run-id> --approve --by <谁>`（或 `--reject`）。
+
+### 5.1 批量放行（避免"闸门疲劳"）
+
+逐条 approve 在批量作业里会退化成闭眼点确认键——闸门形同虚设。所以批量时
+**把 N 个对象收成一次决定**，并把影响面一起摆出来：
+
+```jsonc
+{ "id": "review", "kind": "approve", "effects": "read", "batch": true,
+  "items": "${steps.plan.out}",                  // 这一批要动哪些对象
+  "impact": { "blastRadius": "12 台设备 / 同租户",
+              "reversible": false,
+              "note": "改错要人工在平台上回改，不能一键回滚" },
+  "message": "即将对 12 台设备下发新节目，确认？" }
+```
+
+- 放行卡里会带 `itemCount` 与 `items`（超过 50 条只展示前 50 条 + 截断数）；
+- 一次放行全部：`jobctl resume <run-id> --approve --by 张三`
+- **部分放行**：`--approve --only A,C`（只放这两个）或 `--reject-items B`（驳回 B，其余放行）；
+- 决定结果落进 run 状态，下游步骤可以直接引用：
+
+```jsonc
+{ "id": "apply", "kind": "map", "for_each": "${steps.review.approvedItems}", "steps": [ ... ] }
+```
+
+**注意**：`approve` 只有"意愿"没有"权力"。真正拦住副作用的是每个写步骤自己的
+`gate: approve`（引擎在派发前执行）。所以批量放行之后，若下游步骤仍是
+`effects: write` + `gate: approve`，它们**各自还会再要一次放行**——
+这是故意的：一次批量意愿 ≠ 对每一条的授权。要让批量真正生效，
+下游步骤的卡片证据等级必须到 `verified-repeat`（见 safety.md §2）。
 
 **写操作不要用 `approve` 代替闸门配置**：`kind: notify` / `effects: write` 的步骤自己就要
 `gate: approve`；`approve` 步骤是额外的检查点（例如「提交前让人核对金额」）。

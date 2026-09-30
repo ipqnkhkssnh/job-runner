@@ -212,6 +212,66 @@ def inv_rows_preserved(args, base, ctx):
     return f"行数守恒（{before}）"
 
 
+def inv_field_equals(args, base, ctx):
+    """**写后回读**的主力判据：定位到 key==value 那条记录，核它的 field 是不是期望值。
+
+    没有 API 的系统里，这是唯一能落到数据层的"我做对了"的证明——
+    比"界面上弹了个成功提示条"硬得多：读错了对象、写没生效、被静默回滚，都会在这里露出来。
+    """
+    rows = load_records(args["path"], base)
+    key, want, field = args["key"], args["value"], args["field"]
+    expect = args["equals"]
+    hit = None
+    for r in rows:
+        if str(_col(r, key)).strip() == str(want).strip():
+            hit = r
+            break
+    if hit is None:
+        raise DataError(
+            f"{args['path']} 里找不到 {key}={want} 的记录——回读没读到目标对象，"
+            f"不能认为写成功了（共 {len(rows)} 行）")
+    got = _col(hit, field)
+    if str(got).strip() != str(expect).strip():
+        raise DataError(
+            f"回读不符：{key}={want} 的 {field} 实际是 {got!r}，期望 {expect!r}"
+            f"（写操作没生效、写错了对象，或被系统回滚）")
+    return f"回读一致：{key}={want} 的 {field}={got}"
+
+
+def inv_field_in(args, base, ctx):
+    """回读核对（枚举版）：目标记录的 field 必须落在允许集合里。"""
+    rows = load_records(args["path"], base)
+    key, want, field = args["key"], args["value"], args["field"]
+    allowed = [str(x).strip() for x in (args.get("in") or [])]
+    for r in rows:
+        if str(_col(r, key)).strip() == str(want).strip():
+            got = str(_col(r, field)).strip()
+            if got not in allowed:
+                raise DataError(
+                    f"回读不符：{key}={want} 的 {field}={got!r} 不在允许集合 "
+                    f"{allowed} 里")
+            return f"回读一致：{key}={want} 的 {field}={got}"
+    raise DataError(f"{args['path']} 里找不到 {key}={want} 的记录（回读没读到目标对象）")
+
+
+def inv_no_duplicate_side_effect(args, base, ctx):
+    """写操作只发生了一次：按 key 分组的记录数必须正好是 1。
+
+    重复点提交、resume 时把同一步写了两遍——在 GUI 世界里这是最常见的"假成功"。
+    """
+    rows = load_records(args["path"], base)
+    key = args["key"]
+    counts: dict = {}
+    for r in rows:
+        v = str(_col(r, key)).strip()
+        counts[v] = counts.get(v, 0) + 1
+    dup = {k: c for k, c in counts.items() if c > 1}
+    if dup:
+        shown = ", ".join(f"{k}×{c}" for k, c in list(dup.items())[:5])
+        raise DataError(f"{args['path']} 的 {key} 出现重复（疑似重复提交）：{shown}")
+    return f"{len(counts)} 个键各出现 1 次（没有重复写）"
+
+
 REGISTRY = {
     "file_exists": inv_file_exists,
     "not_empty": inv_not_empty,
@@ -224,6 +284,9 @@ REGISTRY = {
     "equal_counts": inv_equal_counts,
     "subset_keys": inv_subset_keys,
     "rows_preserved": inv_rows_preserved,
+    "field_equals": inv_field_equals,
+    "field_in": inv_field_in,
+    "no_duplicate_side_effect": inv_no_duplicate_side_effect,
 }
 
 

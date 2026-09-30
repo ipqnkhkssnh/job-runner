@@ -130,9 +130,42 @@ if __name__ == "__main__":
 - [ ] 每个 `skill` 步骤都有能力卡，且卡里有 `selectors`
 - [ ] 每个 `write`/`outbound`/`irreversible` 步骤都有 `gate: approve`
 - [ ] 每个写操作都有 `idempotency`
+- [ ] **写路径的卡片有 `evidenceLevel` / `impact` / `readback` 三件套**
+- [ ] **没有任何写路径只到 `observed` 或 `unknown`**（该先去 learn-skill 实测）
+- [ ] 批量（`map` / `batch`）里的写路径证据到 `verified-repeat`；不到就别批量
 - [ ] `assert` 覆盖了「一行不丢」「键唯一」「合计对得上」里适用的那些
 - [ ] 失败分类明确（哪类缺口要回写 learn-skill）
 - [ ] 报告里能一眼看出：跑了什么、产出什么、判据过没过、还差什么
+
+## 6.1 写路径的标准形状（照这个抄）
+
+无 API 的系统里，一条写路径的完整形状是**四段**，缺一段就有假成功的空间：
+
+```jsonc
+// 1) 规划（只读，可自动）：先弄清"要动哪些对象"
+{ "id": "plan", "kind": "tool", "run": ["python3", "tools/plan.py", "--out", "${artifacts}/plan.csv"],
+  "out": "artifacts/plan.csv" },
+
+// 2) 一次批量放行（人）：把 N 个对象收成一次决定，附影响面
+{ "id": "review", "kind": "approve", "effects": "read", "batch": true,
+  "items": "${steps.plan.out}", "impact": { "blastRadius": "N 个对象", "reversible": false },
+  "message": "即将对计划内的对象执行变更，确认？" },
+
+// 3) 执行（写，人闸门 + 幂等）：卡片自带 readback，引擎会自动加第 4 段
+{ "id": "apply", "kind": "map", "for_each": "${steps.review.approvedItems}",
+  "steps": [ { "id": "w", "kind": "skill", "use": "some-platform/set-device-params",
+               "effects": "write", "gate": "approve", "idempotency": "set:${item}",
+               "inputs": { "sn": "${item}" }, "out": "artifacts/applied/${item}.json" } ] },
+
+// 4) 汇总校验（可选，但强烈建议）：把回读产物再交叉验一次
+{ "id": "verify-all", "kind": "assert",
+  "invariants": [ { "name": "no_duplicate_side_effect",
+                    "path": "artifacts/readback.csv", "key": "sn" } ] }
+```
+
+第 3 段里每个元素都会各自过一遍：**写闸门（放行）→ 执行 → 写后回读（判据）**。
+所以一次批量 12 台设备，除非卡片证据到 `verified-repeat`，否则会停下来问 12 次——
+这不是引擎笨，是"这 12 次谁负责"只能由人回答。想少问，就得先把实测攒够。
 
 ## 7. 反模式（见到就改）
 
@@ -140,7 +173,11 @@ if __name__ == "__main__":
 |---|---|---|
 | 把界面文案/坐标写进 job | 界面一改就碎 | 进能力卡的 `selectors` |
 | 让模型在对话里算金额/汇总 | 不可复现、不可验证 | `tool` 脚本 |
-| 用「看到提示条」当成功判据 | 只证明点了，不证明对了 | 数据层 `assert` |
+| 用「看到提示条」当成功判据 | 只证明点了，不证明对了 | 数据层 `assert` / 卡片 `readback` |
+| 写路径不给 `readback` | 假成功没有出口 | 重新读一次 + `field_equals` |
+| 把没实测的写路径放进 `map` | 一次错误放大成 N 条 | 先实测到 `verified-repeat` |
+| 逐个对象点确认（闸门疲劳） | 人会麻木，闸门失效 | `approve` + `batch`/`items`/`impact` |
+| 卡片写 `channel: local-a2desk` 但目标有 MCP | 让精度最低的环节去干最要紧的事 | `channel: mcp` + `mcp.server/tool` |
 | 一个大 job 做十件事 | 失败无法定位、无法续跑 | 拆成多个 job / 用 `map` |
 | 写操作用 `gate: auto` | 事故来源 | `approve` + `idempotency` |
 | 每次改 job 都新开 run 却不留证据 | 事后说不清 | 报告 + README 记「为什么改」 |

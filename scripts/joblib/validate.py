@@ -9,12 +9,15 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from .cards import CardError, check_requires, resolve_card, validate_card
-from .core import (EFFECTS, GATES, KINDS, MIN_GATE_BY_EFFECT, _GATE_RANK,
-                   JobError, head_of, refs_in, secret_hits)
+from .cards import (CardError, card_evidence, card_impact, check_requires, resolve_card,
+                    validate_card)
+from .core import (CHANNELS, EFFECTS, GATES, KINDS, MIN_GATE_BY_EFFECT, _GATE_RANK,
+                   JobError, evidence_at_least, head_of, refs_in, secret_hits)
 from .invariants import unknown_invariants
 
 ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
+#: 副作用严密度序数（低报副作用等于绕过闸门，所以要能比大小）
+_EFFECT_RANK = {lv: i for i, lv in enumerate(EFFECTS)}
 KNOWN_HEADS = {"inputs", "steps", "item", "index", "run", "job", "env", "secrets", "loop",
                "artifacts"}   # artifacts = ${run.artifacts} 的简写，作者天天要用
 
@@ -113,6 +116,20 @@ def validate_job(job: dict, job_dir: Path, skills_root: Path) -> tuple:
                     f"（写/对外/不可逆操作必须人工放行）")
             elif effects == "write" and gate == "approve" and not step.get("idempotency"):
                 warnings.append(f"{tag} 是写操作但没有声明 idempotency（重复执行可能产生两条数据）")
+            if effects == "irreversible" and not step.get("idempotency"):
+                errors.append(
+                    f"{tag} 是不可逆操作（{effects}）却没声明 idempotency——"
+                    f"按 safety.md 红线，不可逆动作不做幂等保护不允许重跑")
+        if step.get("channel") and step["channel"] not in CHANNELS:
+            errors.append(f"{tag} channel 不认识：{step['channel']!r}"
+                          f"（可用：{', '.join(CHANNELS)}）")
+
+        # 批量执行：只被"看到"过的写路径不许批量跑
+        in_batch = bool(ancestors) or bool(step.get("for_each"))
+        if in_batch and effects in ("write", "outbound", "irreversible"):
+            warnings.append(
+                f"{tag} 在批量（map/for_each）里执行 {effects} 操作："
+                f"如果它的能力卡证据等级不到 verified-repeat，validate 会拒绝（批量=放大错误）")
 
         # out 路径安全
         for o in (step.get("out") or []) if isinstance(step.get("out"), list) else ([step["out"]] if step.get("out") else []):
@@ -160,10 +177,53 @@ def validate_job(job: dict, job_dir: Path, skills_root: Path) -> tuple:
                         step["use"], job_dir, skills_root, inline=step.get("card"))
                     cerrs = validate_card(card, cpath)
                     errors.extend(f"{tag} {e}" for e in cerrs)
+                    ev = card_evidence(card)
+                    ceffects = step.get("effects", card.get("effects", "read"))
                     info.setdefault("cards", []).append(
                         {"step": path, "skill": skill, "task": task,
-                         "version": card.get("version"),
+                         "version": card.get("version"), "effects": ceffects,
+                         "channel": step.get("channel") or card.get("channel"),
+                         "evidenceLevel": ev,
+                         "impact": card_impact(card),
+                         "readback": bool(card.get("readback")),
                          "path": str(cpath) if cpath else "inline"})
+
+                    # ---- 证据阶梯：这张卡是被"看到"的，还是被"跑过"的 ----
+                    if ceffects in ("write", "outbound", "irreversible"):
+                        if ev == "unknown":
+                            errors.append(
+                                f"{tag} 能力卡 {skill}/{task} 的证据等级是 unknown（没学过/没实测）"
+                                f"，却要做 {ceffects} 操作——先用 learn-skill 模式 B 实测一遍，"
+                                f"把 evidenceLevel 升到 observed 以上")
+                        elif ev == "observed":
+                            if in_batch:
+                                errors.append(
+                                    f"{tag} 能力卡 {skill}/{task} 只到 observed（录屏里看到，没实操）"
+                                    f"，却被放在批量（map/for_each）里执行 {ceffects}——"
+                                    f"批量会放大错误：先实测到 verified-repeat，或拆成单件逐步放行")
+                            else:
+                                warnings.append(
+                                    f"{tag} 能力卡 {skill}/{task} 的写路径只到 observed"
+                                    f"（未实测）——运行时会强制人闸门，放行卡会标注该等级，"
+                                    f"请如实告知用户")
+                        elif ev == "verified-once" and in_batch:
+                            warnings.append(
+                                f"{tag} 能力卡 {skill}/{task} 是 verified-once 却在批量里："
+                                f"只允许逐批放行（每批都要人确认），不能一次放行全部")
+                    if ceffects in ("write", "outbound", "irreversible") \
+                            and not card.get("readback"):
+                        errors.append(
+                            f"{tag} 能力卡 {skill}/{task} 是写操作但没有 `readback`——"
+                            f"没有回读就只剩『界面上看到成功提示』这一种判据，"
+                            f"那正是假成功的来源")
+                    card_eff = card.get("effects", "read")
+                    if card_eff in EFFECTS and step.get("effects", "read") in EFFECTS \
+                            and _EFFECT_RANK.get(step.get("effects", "read"), 0) \
+                            < _EFFECT_RANK.get(card_eff, 0):
+                        errors.append(
+                            f"{tag} 步骤把副作用低报成 {step.get('effects')}，"
+                            f"而能力卡 {skill}/{task} 是 {card_eff}——"
+                            f"以更严的为准（低报副作用 = 绕过闸门）")
                 except CardError as exc:
                     # 卡片缺失 ≠ 配置错误，而是**知识还没学过**：
                     # validate 只警告；run 跑到这里会暂停并记一条 knowledge 缺口，
@@ -187,6 +247,19 @@ def validate_job(job: dict, job_dir: Path, skills_root: Path) -> tuple:
         elif kind == "approve":
             if not step.get("message"):
                 warnings.append(f"{tag} approve 步骤建议写 `message`（好让放行的人知道在批什么）")
+            batch = bool(step.get("batch")) or bool(step.get("items"))
+            if batch:
+                if not step.get("items"):
+                    warnings.append(
+                        f"{tag} 声明了 batch 却没写 `items`（放行卡里看不出这一批覆盖哪些对象）")
+                if not step.get("impact"):
+                    warnings.append(
+                        f"{tag} 批量放行建议写 `impact`（影响面：波及多少对象、能不能回退）——"
+                        f"一次点确认覆盖 N 个对象的闸门，不写影响面就等于让人盲批")
+                if step.get("effects", "read") == "read":
+                    warnings.append(
+                        f"{tag} 批量放行的 effects 是 read：下游写步骤要各自带够闸门，"
+                        f"这个 approve 只是「批量意愿」而不是「批量授权」")
         elif kind == "notify":
             if not step.get("target"):
                 errors.append(f"{tag} notify 步骤缺 `target`（{kind: file|http|command}）")

@@ -25,12 +25,18 @@
 "inputs": [
   { "name": "scope", "type": "list", "required": true,
     "desc": "这次要处理的范围（客户名/单号/分片）" },
-  { "name": "period", "type": "string", "required": false, "desc": "账期 YYYY-MM" }
+  { "name": "period", "type": "string", "required": false, "desc": "账期 YYYY-MM" },
+  { "name": "topN", "type": "number", "required": false, "default": 10,
+    "desc": "没传就用 10" }
 ]
 ```
 `type` 取值：`string` / `list` / `file` / `path` / `json` / `number` / `bool`。
 运行时传参：`--input scope=a,b,c`（逗号自动变列表，`[...]`/`{...}` 会按 JSON 解析）
 或 `--inputs-file params.json`。**必填项没传，引擎直接拒绝跑。**
+
+**可选入参没传时**：写了 `default` 就用默认值；没写 `default` 则值为 `null`。
+引用它是**合法**的（声明过就是已知入参）——整串引用拿到 `null`（下游可以据此"不传这个参数"），
+嵌在命令行里的引用渲染成空串。**不会**因为"这次没传"就让整个作业在引用解析上失败。
 
 ### requires
 
@@ -73,12 +79,16 @@
 | `kind` | — | `tool` / `skill` / `map` / `assert` / `approve` / `notify` |
 | `when` | 无 | 条件：`"${inputs.flag}"`、`"effects==write"`、`"env==prod"`；不成立就整步跳过（记 `skipped`） |
 | `effects` | `read` | `read` / `write` / `outbound` / `irreversible` |
-| `gate` | `auto` | `auto` / `outbound` / `approve`；宽松于 `effects` 要求 → validate 报错 |
+| `gate` | `auto` | `auto` / `outbound` / `approve`；宽松于 `effects` 要求 → validate 报错；**写以上会被引擎在执行前真正拦人**（不是只声明） |
+| `channel` | 卡片的 | 覆盖能力卡通道：`mcp` / `api` / `remote-a2desk` / `local-a2desk` / `playwright` / `human` / `auto` |
 | `idempotency` | 无 | 幂等键（可含引用）。`effects != read` 且跨 run 命中账本 → 跳过 |
 | `out` | 无 | 产物 glob（**相对 run 目录**，如 `artifacts/x.csv`）。声明了却没有文件 → 失败 |
 | `verify` | 无 | 该步骤完成后的数据层判据（同 assert 的不变量） |
 | `timeout` | 3600 | tool 超时秒数 |
 | `errorClass` | `env` | tool 非零退出时的失效分类 |
+
+`kind: approve` 额外支持批量放行：`batch`（true）、`items`（这批要动哪些对象）、
+`impact`（影响面，原样进放行卡）。见 `step-kinds.md` §5.1。
 
 **作用域**：`out` / `verify` 在 map 子步骤里可以用 `${item}`。
 
@@ -103,13 +113,15 @@
 
 ```jsonc
 {
-  "card": "v1",                       // 契约版本，当前只认 v1
+  "card": "v2",                       // 契约版本：v1（只读时代）/ v2（写路径三件套）
   "skill": "some-platform",
   "task": "collect-records",
   "title": "人能看懂的任务名",
   "version": "0.3.0",                 // 必须与技能 state/meta.json 的版本一致
   "system": "哪个系统",
-  "channel": "auto",                  // auto/remote-a2desk/local-a2desk/playwright/human
+  "channel": "auto",                  // auto/mcp/api/remote-a2desk/local-a2desk/playwright/human
+  "mcp": { "server": "bbcs", "tool": "bbcs_preview_terminal_change" },
+                                      // channel=mcp 时必填：直接调工具，不去点界面
   "envClass": "test",
   "effects": "read",                  // 与 job 步骤的 effects 取更严的那个
   "inputs":  [ { "name": "key", "type": "string", "required": true, "desc": "..." } ],
@@ -128,7 +140,22 @@
   "effectsDetail": { "changes": "…", "outbound": "…", "idempotent": "…" },
   "evidence": { "frames": "f018-f024", "assets": [] },
   "unknowns": [ "界面上看到但没操作过的分支" ],
-  "updatedAt": "YYYY-MM-DD"
+  "updatedAt": "YYYY-MM-DD",
+
+  // ---- 写路径（effects != read）必填三件套 ----
+  "evidenceLevel": "observed",        // unknown < observed < verified-once < verified-repeat
+  "evidenceBasis": "2026-09-27 录屏 f018-f024，未实操",
+  "impact": { "blastRadius": "单台设备", "count": 1, "reversible": true,
+              "note": "改错要人工在平台上改回来" },
+  "readback": {                       // ★ 写完之后拿什么只读地回读核对
+    "how": "skill",                   // skill：再暂停一次让 agent 重读；tool：跑脚本自动回读
+    "use": "some-platform/query-device",
+    "out": "artifacts/readback/${item}.csv",
+    "expect": [ { "name": "field_equals", "path": "artifacts/readback/${item}.csv",
+                  "key": "sn", "value": "${item}",
+                  "field": "gps", "equals": "开启" } ],
+    "note": "为什么这样算回读成功"
+  }
 }
 ```
 
@@ -136,9 +163,38 @@
 1. `card` / `skill` / `task` / `version` / `outputs` 必须存在；
 2. `outputs[].path` 必须是 run 目录内的相对路径（不允许绝对路径或 `..`）；
 3. `secretsRef` 只能是 `ref:xxx`；
-4. `effects` 必须是四级之一。
+4. `effects` 必须是四级之一；
+5. `channel` 必须是已知通道；`channel: mcp` 必须同时给 `mcp.server` + `mcp.tool`；
+6. **`effects != read` 时 `evidenceLevel` / `impact` / `readback` 三者必填**——
+   分别回答「多可信」「错多大」「拿什么核对」；缺任何一个 validate 直接报错。
 
-**卡里必须有 `selectors`**——否则 agent 只能靠猜坐标，正是 learn-skill 红线禁止的事。
+**卡里必须有 `selectors`**（**界面通道**：`remote-a2desk` / `local-a2desk` / `playwright` / `human`）——
+否则 agent 只能靠猜坐标，正是 learn-skill 红线禁止的事。
+接口通道（`mcp` / `api`）改用 `mcp: {server, tool|tools}` 这份**调用契约**代替 selectors
+（一个任务要用多个工具时用 `tools: [...]`，`tool` 写主工具）；
+`auto` 两者都不强制，但 agent 就得靠猜——不建议。
+
+### 5.1 写后回读（`readback`）：无 API 系统的数据层判据
+
+没有 API 的系统拿不到数据层，"写成功了吗"就只能靠界面提示条——那正是假成功的来源
+（弹了成功提示、但其实写错对象/被回滚/没生效）。`readback` 把这件事变成可判定的：
+
+- `how: "skill"`：引擎在写阶段之后**再暂停一次**（`phase: readback`），要 agent 用
+  `use` 指定的只读任务重新查一次刚改的对象，把结果落成 `out` 产物；
+- `how: "tool"`：引擎直接跑 `run` 里的脚本（适合有接口/CLI 可以查回来的场景）；
+- 两种情况最后都跑 `expect` 里的不变量，**不通过就判 `data` 失败**。
+
+`expect` 里最好用的是这三条（专为回读加的）：
+
+| 不变量 | 干什么 | 典型用法 |
+|---|---|---|
+| `field_equals` | 定位 `key == value` 那条记录，核它的 `field` 是不是 `equals` | 改完设备参数后回读 `gps == 开启` |
+| `field_in` | 同上，但值只要落在允许集合里 | 状态字段的合法取值有多个 |
+| `no_duplicate_side_effect` | 按 key 分组的记录数必须都是 1 | 抓"重复点提交"产生的两条单据 |
+
+**没有 `readback` 的写路径 validate 会拒绝**。真遇到确实无法回读的界面，
+把原因写进卡片的 `automationBoundary.notes` 并降级为"每次都要人核对"，
+而不是假装能自动验证。
 
 ## 6. 失效分类（`onFailure.classify`）
 
@@ -153,9 +209,19 @@
 
 - 结构：`job`/`steps`/id 唯一且 kebab-case/kind 合法/各 kind 必填项齐全；
 - 引用：表达式语法、`steps.<id>` 存在、`inputs.<name>` 已声明、头名合法；
-- 闸门：`effects` 与 `gate` 是否匹配（写以上必须人工放行）；写操作没声明 `idempotency` 会警告；
+- 闸门：`effects` 与 `gate` 是否匹配（写以上必须人工放行）；写操作没声明 `idempotency` 会警告，
+  **不可逆操作没声明 `idempotency` 直接报错**；`channel` 取值合法；
+- **证据阶梯**：卡片 `effects != read` 时必须有 `evidenceLevel` / `impact` / `readback`；
+  `unknown` 的写路径直接拒绝；`observed` 的写路径**放进 `map` 会被拒绝**（批量放大错误）；
+  `verified-once` 在批量里给出"只能逐批放行"的警告；
+- **低报副作用**：步骤 `effects` 比卡片的松 → 报错（低报 = 绕过闸门）；
+- 批量闸门：`batch`/`items` 却没写 `impact` → 警告（不能让人盲批）；
 - 安全：`out` 路径不得逃出 run 目录；job 目录里扫凭据（私钥/AK/token/`password=` 等）；
 - 知识：能力卡存在性（缺失 → **警告**，运行时会暂停等补学）、卡片字段合法性、
   `requires.skills` 版本是否满足、`requires.env.secrets` 是否只写引用；
 - 数据：`assert` 的不变量名是否已知；
 - 提醒：`env.class` 未写、`onFailure` 未写会警告。
+
+**看不清全貌时**跑 `jobctl.py audit`：它把每个技能的每个任务、有没有能力卡、副作用等级、
+证据等级、有没有回读判据、以及"这条路径到底能不能自动跑"一次性列出来——
+这是"AI 准不准"唯一诚实的基线。

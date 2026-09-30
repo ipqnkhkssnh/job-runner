@@ -28,13 +28,16 @@ whenToUse: 一件事要跨多个系统或多次重复、步骤多到不该每次
 1. **数据走文件，不走对话**：步骤之间只传路径（`${artifacts}/x.csv`）。几千行表格、长流程、断点续跑，全靠这一条。
 2. **确定性优先**：能写成脚本的绝不交给模型临场算；模型只在语义不可约处出手（找界面元素、判歧义、归因）。
 3. **判据落数据层**：`kind:"assert"` 要证明「条数守恒 / 键唯一 / 合计相等 / 一行不丢」，不是「看到提示条」。
-4. **副作用分级 + 人闸门**：`read < write < outbound < irreversible`；写以上必须 `gate: approve`；写操作还要 `idempotency`。
+4. **副作用分级 + 人闸门**：`read < write < outbound < irreversible`；写以上必须 `gate: approve`——**引擎在副作用发生前真正拦人**（不是只在 validate 里声明）；写操作还要 `idempotency`。
 5. **凭据不入库**：只写 `ref:xxx` 引用，值由用户现场提供；`validate` 会扫泄漏。
-6. **不许偷偷改技能包**：执行中发现界面与能力卡不符 → 写 `gaps`，交回 `learn-skill` 模式 B。
-7. **缺口分三类**：`env`（环境，现场修） / `knowledge`（没学过，回写 learn-skill） / `data`（数据/判据，查上游）。**只有 knowledge 进补学单。**
-8. **先 dry-run 再真跑**：`--dry-run` 推演一遍全链路，确认步骤、入参、闸门位置。
-9. **每一步都要能回答「失败怎么办」**：不能续跑的长流程等于没有。
-10. **不写一次性脚本**：job 目录里的 `tools/` 是资产，下次同类事直接复用。
+6. **知识要分等级**：能力卡必须写 `evidenceLevel`（`unknown < observed < verified-once < verified-repeat`）。**没实测过的写路径不许自动跑，更不许批量**——批量会把一次错误放大成 N 条错数据。
+7. **写了一定要回读**：写路径的卡片必须给 `readback`（重新读一次 + 比对字段值）。没有 API 的系统里，"界面上弹了成功提示"不算判据，那正是假成功的来源。
+8. **能走接口就别点界面**：通道优先级 `mcp > api > remote-a2desk > local-a2desk > playwright > human`。界面操作是全链路里精度最低的一环，能少一次就少一次。
+9. **不许偷偷改技能包**：执行中发现界面与能力卡不符 → 写 `gaps`，交回 `learn-skill` 模式 B。
+10. **缺口分三类**：`env`（环境，现场修） / `knowledge`（没学过，回写 learn-skill） / `data`（数据/判据，查上游）。**只有 knowledge 进补学单。**
+11. **先 dry-run 再真跑**：`--dry-run` 推演一遍全链路，确认步骤、入参、闸门位置。
+12. **每一步都要能回答「失败怎么办」**：不能续跑的长流程等于没有。
+13. **不写一次性脚本**：job 目录里的 `tools/` 是资产，下次同类事直接复用。
 
 ## 2. 作业区与文件
 
@@ -47,9 +50,11 @@ whenToUse: 一件事要跨多个系统或多次重复、步骤多到不该每次
 │   ├── tools/                         # kind:"tool" 调的脚本（业务计算都在这）
 │   └── cards/                         # 仅本地/示例用的能力卡（正式的卡在技能包里）
 └── runs/<run-id>/
-    ├── run.json                       # 进度状态（续跑靠它）
-    ├── pending/<step>.json            # 给 agent / 人的指令（暂停点）
+    ├── run.json                       # 进度状态（续跑靠它；含批量放行的批准/驳回清单）
+    ├── pending/<step>.json            # 给 agent / 人的指令（phase: exec）
     ├── pending/<step>.result.json     # 执行方写回的结果
+    ├── pending/<step>.gate.json       # 写闸门放行卡（含影响面与证据等级）
+    ├── pending/<step>.readback.json   # 写后回读指令（phase: readback）
     ├── artifacts/                     # 产物（交付物的唯一来源）
     ├── evidence/<step>/               # 每步的截图/证据
     ├── logs/                          # tool 的 stdout/stderr
@@ -59,12 +64,17 @@ whenToUse: 一件事要跨多个系统或多次重复、步骤多到不该每次
 
 ## 3. 标准流程
 
-### Step 0 · 先看有没有现成的
+### Step 0 · 先看有没有现成的，以及知识够不够
 ```bash
 JOBCTL="python3 ~/.agents/skills/job-runner/scripts/jobctl.py"
 $JOBCTL list                     # 有没有做过同类 job（改比写快）
-$JOBCTL card <skill>/<task>      # 要用的能力卡在不在、字段全不全
+$JOBCTL audit                    # ★ 知识体检：哪些任务的卡齐、证据到几级、能不能自动跑
+$JOBCTL card <skill>/<task>      # 要用的能力卡在不在、字段全不全、有没有回读判据
 ```
+
+`audit` 是回答「这件事现在到底能不能交给 AI 自动做」的入口：它把每个技能的每个任务、
+有没有机器读的能力卡、副作用等级、证据等级、有没有回读判据一次列出来。
+**有写路径而证据只有 `observed`，就该先去 learn-skill 实测，而不是硬跑。**
 
 ### Step 1 · 拆步骤（照这四类分派）
 
@@ -75,6 +85,7 @@ $JOBCTL card <skill>/<task>      # 要用的能力卡在不在、字段全不全
 | N 个对象重复 | `kind: "map"` + `for_each` | 引擎 |
 | 判据 | `kind: "assert"` | 脚本 |
 | 写/对外/不可逆前 | `kind: "approve"` / `gate: approve` | 人 |
+| N 个对象的放行 | `kind: "approve"` + `batch` / `items` / `impact` | 人（一次决定一批，别让他点 N 次） |
 
 ### Step 2 · 写 job
 ```bash
@@ -83,26 +94,38 @@ $EDITOR ~/.agents/jobs/<job-name>/job.jsonc
 ```
 格式全文见 `references/job-format.md`；每种步骤的字段与坑见 `references/step-kinds.md`。
 
+写路径（`effects != read`）的卡片必须给三件套：`evidenceLevel`（多可信）、`impact`（错多大）、
+`readback`（拿什么回读核对）。缺任何一个 validate 直接拒绝——这是 v2 契约。
+
 ### Step 3 · 校验 + 推演
 ```bash
-$JOBCTL validate <job>                       # 结构 / 引用 / 闸门 / 凭据 / 能力卡
+$JOBCTL validate <job>                       # 结构/引用/闸门/证据等级/凭据/能力卡
 $JOBCTL run <job> --dry-run --input k=v      # 推演：不执行任何副作用
 ```
 **校验不通过就不要跑。** 报错分两类：job 写错了（改 job）、知识没学过（去补学）。
+"证据等级不够"属于第二类：去 learn-skill 模式 B 实测，回来把 `evidenceLevel` 升上去。
 
 ### Step 4 · 跑，并在暂停点接手
 ```bash
 $JOBCTL run <job> --input scope=a,b,c        # 退出码 3 = 暂停
-$JOBCTL status <run-id>                      # 看停在哪、为什么停
+$JOBCTL status <run-id>                      # 看停在哪、为什么停、什么阶段
 ```
-暂停分两种：
-- `needs_agent`（skill 步骤）：读 `pending/<step>.json`，按里面的 `capability.selectors` 用
-  a2desk/playwright 操作，**每步截图存进 `evidenceDir`**，然后写 `resultFile`，再 `resume`。
-- `needs_user`（approve / 对外投递）：把指令里的内容**原样**念给用户，等他明确同意。
+暂停有四种（看 `phase` 字段）：
+- `needs_agent` + `phase: exec`（skill 步骤）：读 `pending/<step>.json`，按里面的
+  `capability.selectors` 用 **mcp → api → a2desk → playwright** 的顺序操作，
+  **每步截图存进 `evidenceDir`**，然后写 `resultFile`，再 `resume`。
+- `needs_user` + `phase: gate`（写闸门）：**副作用发生之前**的放行。把 `impact` / `evidence` /
+  `willDo` 原样念给用户，等他明确答复。**没放行之前什么都不会发生。**
+- `needs_agent` + `phase: readback`（写后回读）：写操作已经执行，现在去**重新读一次**刚改的对象，
+  把真实值落成产物，写 `<step>.readback.result.json`。不一致就照实报告，别硬说成功。
+- `needs_user`（approve / 对外投递，可能是一批）：把指令里的内容**原样**念给用户。
   ```bash
-  $JOBCTL resume <run-id> --approve --by 张三
-  $JOBCTL resume <run-id> --reject  --note "金额不对"
+  $JOBCTL resume <run-id> --approve --by 张三              # 放行（批量=放行全部）
+  $JOBCTL resume <run-id> --reject  --note "金额不对"       # 驳回
+  $JOBCTL resume <run-id> --approve --only A,C             # 批量里只放 A、C
+  $JOBCTL resume <run-id> --reject-items B                 # 驳回 B，其余放行
   ```
+  **agent 不可以自己放行**：`--approve` 必须来自用户的明确答复。
 
 ### Step 5 · 收口
 ```bash
@@ -135,14 +158,17 @@ $JOBCTL gaps  <run-id> --brief   # 有缺口 → 生成给 learn-skill 的补学
   用 learn-skill 模式 B 补学；补完直接 `resume`，不用重跑整个 job。
 - **job 声明依赖技能版本**（`requires.skills`），版本不满足直接拒绝跑——避免用旧知识跑新流程。
 - 执行中发现界面与卡不符 → 只写 `gaps`，不动技能包。
+- **补学完要顺手升证据等级**：实测通过一次 → `verified-once`；多次/回归过 → `verified-repeat`。
+  等级不升，编排侧就只能把它当"没实测过"处理（写要人放行、禁止批量），
+  这正是让闸门不至于退化成点确认键的关键。
 
 ## 5. 参考文档
 
 | 文件 | 什么时候读 |
 |---|---|
-| `references/job-format.md` | 写 job：字段、引用表达式、能力卡契约、校验规则 |
-| `references/step-kinds.md` | 6 种步骤怎么用、坑在哪、怎么加新 kind |
-| `references/safety.md` | 副作用分级、闸门、幂等、凭据、对外投递 |
+| `references/job-format.md` | 写 job：字段、引用表达式、能力卡契约（含 readback）、校验规则 |
+| `references/step-kinds.md` | 6 种步骤怎么用、坑在哪、怎么加新 kind（含写闸门与回读阶段） |
+| `references/safety.md` | 副作用分级、证据阶梯、闸门聚合、幂等、凭据、对外投递 |
 | `references/recovery.md` | 失败归因、续跑、幂等跳过、replay |
 | `references/authoring-guide.md` | 从零写一个 job（含从一次成功操作固化成 job） |
 | `examples/` | 两个可跑示例：纯脚本、GUI 交接 |
@@ -152,4 +178,7 @@ $JOBCTL gaps  <run-id> --brief   # 有缺口 → 生成给 learn-skill 的补学
 ```bash
 bash ~/.agents/skills/job-runner/scripts/selftest.sh
 ```
-覆盖：端到端跑通、断点续跑、幂等、GUI 交接、人闸门、判据拦截、能力卡缺失归因、凭据 lint。
+覆盖：端到端跑通、断点续跑、幂等、GUI 交接、人闸门、判据拦截、能力卡缺失归因、凭据 lint，
+以及 v2 新增的：**写闸门在副作用之前真的拦人**、缺证据等级/影响面/回读的写卡被拒、
+`observed` 写路径被禁止批量、低报副作用被拒、写后回读两阶段（不一致判失败）、
+批量闸门的部分放行、`jobctl audit` 知识体检。

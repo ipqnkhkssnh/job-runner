@@ -24,6 +24,26 @@ GATES = ("auto", "approve", "outbound")
 FAIL_CLASSES = ("env", "knowledge", "data", "unknown")
 ENV_CLASSES = ("test", "prod", "any", "unknown")
 
+#: 通道优先级：**越靠前越确定**。有确定性接口就别去点界面（界面操作是精度最低的一环）。
+CHANNEL_PRIORITY = ("mcp", "api", "remote-a2desk", "local-a2desk", "playwright", "human")
+CHANNELS = CHANNEL_PRIORITY + ("auto",)
+
+#: 能力卡证据等级：这张卡是被"看到"的，还是被"跑过"的？
+#:   unknown         没见过 / 只有猜想        → 只允许只读探测，写操作一律拒绝
+#:   observed        录屏或界面上看到，没实操  → 允许人闸门下单件写，禁止批量
+#:   verified-once   现场实测成功过 ≥1 次      → 允许人闸门下写，允许批量但逐批放行
+#:   verified-repeat 多次实测 / 回归过         → 允许一次批量放行（写仍必须 approve 闸门）
+EVIDENCE_LEVELS = ("unknown", "observed", "verified-once", "verified-repeat")
+_EVIDENCE_RANK = {"unknown": 0, "observed": 1, "verified-once": 2, "verified-repeat": 3}
+
+#: 每个证据等级允许走到哪一步（写进放行卡，让人知道自己批的是什么成色的东西）
+EVIDENCE_MEANING = {
+    "unknown": "没见过/只有猜想——只允许只读探测，写操作一律拒绝",
+    "observed": "录屏或界面上看到过，没实操——只允许人闸门下单件执行，禁止批量",
+    "verified-once": "现场实测成功过至少一次——人闸门下单件或逐批执行",
+    "verified-repeat": "多次实测/回归过——允许一次批量放行（写仍必须人闸门）",
+}
+
 #: 每种副作用等级允许的最小闸门（gate 比它更松就是错误）
 MIN_GATE_BY_EFFECT = {
     "read": "auto",
@@ -32,6 +52,43 @@ MIN_GATE_BY_EFFECT = {
     "irreversible": "approve",
 }
 _GATE_RANK = {"auto": 0, "outbound": 1, "approve": 2}
+
+
+def evidence_rank(level) -> int:
+    """证据等级的序数；不认识的一律当 unknown（最保守）。"""
+    return _EVIDENCE_RANK.get(str(level or "unknown"), 0)
+
+
+def stricter_effect(*levels) -> str:
+    """取最严的副作用等级。
+
+    步骤声明与能力卡声明不一致时**以更严的为准**——否则"顺手把 effects 写成 read"
+    就能绕过写闸门，那闸门等于没有。
+    """
+    best = "read"
+    for lv in levels:
+        if lv in EFFECTS and EFFECTS.index(str(lv)) > EFFECTS.index(best):
+            best = str(lv)
+    return best
+
+
+def evidence_at_least(level, floor) -> bool:
+    return evidence_rank(level) >= evidence_rank(floor)
+
+
+def gate_for(effects: str, evidence: str = "verified-repeat", batched: bool = False) -> str:
+    """算这一步**至少**要什么闸门。
+
+    写以上永远要 `approve`——闸门不因为证据等级高而放松。
+    证据等级只影响「能不能批量」：不够 `verified-repeat` 就不允许被批量放行，
+    这一条由 validate 的 `batch_allowed()` 单独管，不混进闸门等级里。
+    """
+    return MIN_GATE_BY_EFFECT.get(effects, "approve")
+
+
+def batch_allowed(evidence: str) -> bool:
+    """证据不足的写路径只允许单件执行（每件各过一次人闸门）。"""
+    return evidence_at_least(evidence, "verified-repeat")
 
 PAUSE_EXIT = 3
 FAIL_EXIT = 1
@@ -117,6 +174,27 @@ def job_file_of(job_dir: Path) -> Path:
             return f
     raise JobError(
         f"{job_dir} 下没有 job 定义文件（期望 {' / '.join(JOB_FILENAMES)}）")
+
+
+def apply_input_defaults(job: dict, provided: dict) -> dict:
+    """把入参声明里的 `default` 落到实际入参上；`required: false` 且没传也没默认 → None。
+
+    为什么要这样：job 作者写 `"${inputs.startDate}"` 是**合法**的（声明过就是已知入参），
+    只是这次没传。这时应当解析成「没有值」，而不是让整个作业在引用解析上炸掉——
+    可选入参传不传是调用方的自由，不该变成引擎的硬错误。
+    """
+    out = dict(provided or {})
+    for spec in job.get("inputs") or []:
+        if not isinstance(spec, dict) or not spec.get("name"):
+            continue
+        name = str(spec["name"])
+        if name in out:
+            continue
+        if "default" in spec:
+            out[name] = spec["default"]
+        elif not spec.get("required"):
+            out[name] = None
+    return out
 
 
 # ---------------------------------------------------------------- JSONC / YAML 读取
@@ -293,8 +371,11 @@ def resolve_str(s: str, ctx: dict):
 
     def sub(mm):
         v = _lookup(mm.group(1), ctx)
+        if v is None:
+            # 可选入参没传 → 渲染成空串，而不是把 Python 的 "None" 塞进命令行参数
+            return ""
         if isinstance(v, list):
-            return " ".join(str(x) for x in v)
+            return " ".join("" if x is None else str(x) for x in v)
         if isinstance(v, dict):
             return json.dumps(v, ensure_ascii=False)
         return str(v)
@@ -370,6 +451,12 @@ def append_ledger(root: Path, entry: dict) -> None:
 
 
 def ledger_has_key(root: Path, key: str) -> dict | None:
+    """账本里有没有这个幂等键**真的执行过**。
+
+    两道防线，防止"推演毒化幂等键"（一次 --dry-run 让日后的真跑被静默跳过）：
+      1. 运行时 dry-run 已经不写 key（见 runner._exec_leaf）；
+      2. 这里再跳过任何标记了 dryRun 的条目——万一有别的写入方留下痕迹。
+    """
     f = Path(root) / "ledger.jsonl"
     if not f.is_file():
         return None
@@ -380,6 +467,8 @@ def ledger_has_key(root: Path, key: str) -> dict | None:
         try:
             e = json.loads(line)
         except json.JSONDecodeError:
+            continue
+        if e.get("dryRun"):
             continue
         if e.get("key") == key and e.get("effects") in ("write", "outbound", "irreversible"):
             return e

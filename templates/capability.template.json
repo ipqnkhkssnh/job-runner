@@ -1,5 +1,8 @@
 {
-  "card": "v1",
+  "_doc": "能力卡：learn-skill 写完 tasks/<task>.md 后**必须**同步产出本文件（同名 .json）。它是 job-runner 调用这个任务的唯一接口，字段契约见 job-runner/references/job-format.md §5。",
+  "_v2": "v2 起，写路径（effects != read）必须多写三件套：evidenceLevel（多可信）+ impact（错多大）+ readback（拿什么回读核对）。缺任何一个，jobctl validate 直接拒绝。",
+
+  "card": "v2",
 
   "skill": "some-platform",
   "task": "some-task",
@@ -8,6 +11,8 @@
 
   "system": "这个任务属于哪个系统",
   "channel": "auto",
+  "_channel_note": "通道优先级 mcp > api > remote-a2desk > local-a2desk > playwright > human。有确定性接口就别写 GUI 通道。写 mcp 时必须同时给下面的 mcp 字段。",
+  "mcp": { "server": "mcp 服务器名（channel=mcp 时必填）", "tool": "工具名" },
   "envClass": "unknown",
   "effects": "read",
 
@@ -52,7 +57,31 @@
     "idempotent": "重复执行会怎样"
   },
 
-  "evidence": { "frames": "f018-f024", "assets": ["assets/xxx.jpg"] },
+  "evidence": { "frames": "f018-f024", "assets": ["assets/xxx.jpg"],
+                "_note": "这是证据**出处**（帧序号/截图），不是证据等级" },
+
+  "evidenceLevel": "observed",
+  "_evidenceLevel_note": "unknown=没见过（写操作会被拒绝）｜observed=录屏里看到没实操（单件+人闸门，禁止批量）｜verified-once=实测过 1 次｜verified-repeat=多次/回归过（才允许一次批量放行）。effects != read 时必填。",
+  "evidenceBasis": "凭什么定这个等级（例：2026-09-27 录屏 f018-f024，未实操）",
+
+  "impact": {
+    "blastRadius": "出错会波及什么（例：单台设备 / 同租户全部节目）",
+    "count": 1,
+    "reversible": true,
+    "note": "改错了怎么回退（不能一键回滚的，effects 要写 irreversible）"
+  },
+
+  "readback": {
+    "_note": "写完之后拿什么只读地回读核对。没有 API 的系统里，这是唯一能落到数据层的判据——『界面上弹了成功提示』不算。engine 会在写之后自动再暂停一次执行它。",
+    "how": "skill",
+    "use": "some-platform/query-xxx",
+    "out": "artifacts/readback/*.csv",
+    "expect": [
+      { "name": "field_equals", "path": "artifacts/readback/x.csv",
+        "key": "主键列", "value": "期望的主键值", "field": "被改的字段", "equals": "期望值" },
+      { "name": "no_duplicate_side_effect", "path": "artifacts/readback/x.csv", "key": "主键列" }
+    ]
+  },
 
   "unknowns": ["界面上看到但没操作过的分支"],
 

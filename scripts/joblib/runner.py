@@ -18,11 +18,20 @@ import re
 import shutil
 from pathlib import Path
 
-from .core import (KINDS, JobError, append_ledger, expand_globs, ledger_has_key,
-                   now_iso, rand_suffix, read_json, resolve, sha256_file, stamp,
-                   update_registry, write_json)
+from .cards import CardError, resolve_card
+from .core import (KINDS, MIN_GATE_BY_EFFECT, _GATE_RANK, JobError, append_ledger,
+                   apply_input_defaults, expand_globs, ledger_has_key, now_iso,
+                   rand_suffix, read_json, resolve, sha256_file, stamp,
+                   stricter_effect, update_registry, write_json)
 from .invariants import check as check_invariant
-from .kinds import HANDLERS
+from .kinds import HANDLERS, gate_approved, gate_directive
+
+
+def _gate_paths(runner, runtime_key):
+    """人闸门的 pending / result 文件（与执行本身的结果文件分开）。"""
+    sp = str(runtime_key).replace("/", "_")
+    base = runner.run_dir / "pending"
+    return base / f"{sp}.gate.json", base / f"{sp}.gate.result.json"
 
 
 class _Paused(Exception):
@@ -52,7 +61,7 @@ class Runner:
         self.job = job
         self.job_dir = Path(job_dir).expanduser().resolve()
         self.job_file = Path(job_file).expanduser().resolve()
-        self.inputs = dict(inputs or {})
+        self.inputs = apply_input_defaults(job, inputs)
         # 必须绝对化：run 目录会被交给 tool 当工作参数，相对路径会随 cwd 漂移
         self.root = Path(root).expanduser().resolve()
         self.skills_root = Path(skills_root).expanduser().resolve()
@@ -118,10 +127,15 @@ class Runner:
     def _refs(self, step=None, item=None, index=None):
         steps = {}
         for path, st in (self.state.get("steps") or {}).items():
-            steps[path.replace("#", "/")] = {"out": st.get("out") or [],
-                                             "detail": st.get("detail", ""),
-                                             "status": st.get("status")}
-            steps[path] = steps[path.replace("#", "/")]
+            entry = {"out": st.get("out") or [],
+                     "detail": st.get("detail", ""),
+                     "status": st.get("status")}
+            # 步骤产出的额外结构化结果（如批量放行的 approvedItems）直接可引用：
+            #   ${steps.<id>.approvedItems}
+            for k, v in (st.get("extra") or {}).items():
+                entry.setdefault(k, v)
+            steps[path.replace("#", "/")] = entry
+            steps[path] = entry
         ctx = {
             "inputs": self.inputs,
             "steps": steps,
@@ -237,12 +251,78 @@ class Runner:
                 raise _Failed(f"步骤 {runtime_key} 的 kind 不认识：{kind!r}", "data")
             self._exec_leaf(step, runtime_key, runtime_key, item=item, index=index)
 
+    def _step_state(self, runtime_key) -> dict:
+        return self.state["steps"].get(runtime_key) or {}
+
+    def _card_hint(self, step, ctx):
+        """给放行卡找卡片信息（证据等级/影响面）。拿不到就退回 None——闸门照样拦人。"""
+        if step.get("kind") != "skill" or not step.get("use"):
+            return None, None
+        try:
+            card, cpath, _s, _t = resolve_card(
+                step["use"], self.job_dir, self.skills_root, inline=step.get("card"))
+            return card, cpath
+        except CardError:
+            return None, None
+
+    def _result_exists(self, runtime_key, result_file) -> bool:
+        if not result_file:
+            return False
+        return (self.run_dir / result_file).is_file()
+
+    def _ensure_gate(self, step, runtime_key, ctx, card=None, card_path=None):
+        """写 / 对外 / 不可逆操作：**执行之前**必须已经有人放行。
+
+        validate 只保证"你声明了闸门"；真正拦住它的是这里。
+        放行结果落在 `pending/<step>.gate.result.json`，与执行本身的结果文件分开，
+        这样"人批了"和"活干完了"是两件可分别审计的事。
+        """
+        effects = step.get("effects", "read")
+        if card is not None:
+            # 卡片说是写、步骤说是读 → 以更严的为准（不许靠低报副作用绕过闸门）
+            effects = stricter_effect(effects, card.get("effects"))
+        gate = step.get("gate", "auto")
+        if effects == "read" and gate == "auto":
+            return
+        need = MIN_GATE_BY_EFFECT.get(effects, "approve")
+        if _GATE_RANK.get(gate, 0) < _GATE_RANK.get(need, 2):
+            # 闸门声明得不够严：validate 本该拒绝这次运行；真跑到这里说明被绕过了，直接失败
+            raise _Failed(
+                f"步骤 {runtime_key} 的闸门 `{gate}` 覆盖不了 {effects} 操作（至少要 {need}）",
+                "data")
+        if self.dry_run:
+            return
+        _, gate_result = _gate_paths(self, runtime_key)
+        if gate_result.is_file():
+            if gate_approved(ctx, step):
+                ctx["gate_approved"] = True
+                self.ledger({"job": self.job_name, "runId": self.run_id, "step": runtime_key,
+                             "event": "gate-approved", "effects": effects})
+                return
+            raise _Failed(
+                f"人闸门驳回：{effects} 操作未获放行"
+                f"（{gate_result.read_text(encoding='utf-8', errors='ignore')[:200]}）", "unknown")
+
+        directive = gate_directive(step, ctx, card=card, card_path=card_path)
+        gate_pending, _ = _gate_paths(self, runtime_key)
+        gate_pending.parent.mkdir(parents=True, exist_ok=True)
+        write_json(gate_pending, directive)
+        self.state["steps"][runtime_key] = {"status": "paused", "at": now_iso()}
+        self.state["pause"] = directive
+        self.save()
+        self.ledger({"job": self.job_name, "runId": self.run_id, "step": runtime_key,
+                     "event": "gate-pause", "effects": effects})
+        raise _Paused(directive, "user")
+
     def _exec_leaf(self, step, runtime_key, ref_key, item=None, index=None):
-        # 幂等：跨 run 已经做过的写操作直接跳过
+        # 幂等：跨 run 已经做过的写操作直接跳过。
+        # ⚠️ 但 **dry-run 绝不许写账本、也绝不许在这里被判为"做过"**：
+        #    否则一次推演就会毒化幂等键，之后真跑时写操作被静默跳过——
+        #    连带人闸门也不会触发（本 bug 就是真跑时被下游缺产物才暴露的）。
         effects = step.get("effects", "read")
         idem = resolve(step.get("idempotency"), self._refs(step, item, index)) \
             if step.get("idempotency") else None
-        if idem and effects != "read" and not self.ignore_done:
+        if idem and effects != "read" and not self.ignore_done and not self.dry_run:
             hit = ledger_has_key(self.root, str(idem))
             if hit:
                 self.state["steps"][runtime_key] = {
@@ -254,12 +334,20 @@ class Runner:
                              "event": "idempotent-skip", "key": idem})
                 return
 
-        # 结果文件已经写好（暂停后回来）→ 由 handler 消费
+        # 结果文件还没出现（暂停后回来）→ 用**存下来的那份指令**重新暂停。
+        # 注意用 pause 自己记的 resultFile：同一步有 exec / gate / readback 三种阶段，
+        # 各自有独立的结果文件，不能拿死名字去猜。
         pause = self.state.get("pause") or {}
-        if pause and pause.get("step") == runtime_key and not self._has_result(runtime_key):
+        if pause and pause.get("step") == runtime_key \
+                and not self._result_exists(runtime_key, pause.get("resultFile")):
             raise _Paused(pause, self.what_of(pause))
 
         ctx = self._ctx(step, runtime_key, ref_key, item, index)
+
+        # 写闸门：人工放行在**副作用发生之前**
+        if step.get("kind") != "approve":
+            self._ensure_gate(step, runtime_key, ctx, *self._card_hint(step, ctx))
+
         handler = HANDLERS[step["kind"]]
         try:
             result = handler(step, ctx)
@@ -274,13 +362,19 @@ class Runner:
             self.state["steps"][runtime_key] = {
                 "status": "done", "at": now_iso(), "out": result.get("out") or [],
                 "detail": result.get("detail", ""), "effects": effects,
-                "idempotency": idem, "refKey": ref_key}
+                "idempotency": idem, "refKey": ref_key,
+                "extra": result.get("extra") or {}}
             self.state["pause"] = None
             self.save()
-            if effects != "read":
+            # 只有**真跑了**才记副作用与幂等键：dry-run 不许留下任何"我做过"的痕迹
+            if effects != "read" and not self.dry_run:
                 self.ledger({"job": self.job_name, "runId": self.run_id, "step": runtime_key,
                              "event": "side-effect", "effects": effects, "key": idem,
                              "out": result.get("out") or []})
+            elif effects != "read":
+                self.ledger({"job": self.job_name, "runId": self.run_id, "step": runtime_key,
+                             "event": "dry-run-skip", "effects": effects,
+                             "note": "推演：未执行、未记幂等键"})
             return
 
         if result["status"] == "pause":
@@ -353,6 +447,19 @@ class Runner:
         if item is not None:
             refs["item"] = item
             refs["index"] = index
+        # 这一步**自己的**入参也挂进 refs：`${step.inputs.x}`
+        # 为什么必须有（真跑才发现）：能力卡的 readback.expect 要断言的"期望值"往往就是
+        # 这一步自己的入参（如 expect_material），而 `${inputs.x}` 指的是 **job 级**入参——
+        # 两者混用会让**回读阶段**解析失败，而那时副作用已经发生了，重试代价很高。
+        # 注意要在 refs 建好之后再挂：步骤入参自己也可能引用 ${inputs.*}。
+        try:
+            step_inputs = resolve(step.get("inputs") or step.get("in") or {}, refs)
+        except JobError:
+            step_inputs = {}
+        refs["step"] = {"id": runtime_key, "inputs": step_inputs}
+        pause = self.state.get("pause") or {}
+        if pause.get("step") != runtime_key:
+            pause = None
         return {
             "run_id": self.run_id, "run_dir": self.run_dir,
             "artifacts_dir": self.artifacts_dir, "job_dir": self.job_dir,
@@ -361,6 +468,8 @@ class Runner:
             "item": item, "index": index, "dry_run": self.dry_run,
             "skills_root": self.skills_root, "gaps": self.gaps, "asserts": self.asserts,
             "ledger": self.ledger, "pause_what": None,
+            "pause": pause, "step_state": self._step_state(runtime_key),
+            "gate_approved": False,
             "resume_cmd": lambda extra="": self._resume_cmd(extra),
         }
 
@@ -370,10 +479,6 @@ class Runner:
         if extra:
             parts.append(extra)
         return " ".join(parts)
-
-    def _has_result(self, runtime_key):
-        f = self.run_dir / "pending" / f"{runtime_key.replace('/', '_')}.result.json"
-        return f.is_file()
 
     @staticmethod
     def what_of(directive) -> str:
